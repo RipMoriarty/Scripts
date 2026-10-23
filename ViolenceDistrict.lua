@@ -77,6 +77,30 @@ local function getHum()
     return c and c:FindFirstChildOfClass("Humanoid")
 end
 
+-- Полностью останавливает танец (включая "потерянные" дорожки анимации)
+local function stopDance()
+    local mine = danceTrack
+    danceTrack = nil
+    if mine then
+        pcall(function() mine:Stop(0) end)
+        pcall(function() mine:Destroy() end)
+    end
+    local hum = getHum()
+    local animator = hum and hum:FindFirstChildOfClass("Animator")
+    if animator then
+        local ids = {}
+        for _, d in ipairs(DANCES) do
+            ids[d.r6] = true
+            ids[d.r15] = true
+        end
+        for _, t in ipairs(animator:GetPlayingAnimationTracks()) do
+            if t.Animation and ids[t.Animation.AnimationId] then
+                pcall(function() t:Stop(0) end)
+            end
+        end
+    end
+end
+
 -- ================== ИНТРО ==================
 local intro = Instance.new("TextLabel")
 intro.Size = UDim2.fromScale(1, 0.2)
@@ -311,16 +335,13 @@ makeSlider(mainPage, 4, "Скорость", 1, RUN_MAX, function(v) runMult = v 
 
 makeToggle(mainPage, 60, "Танец", false, function(on)
     danceOn = on
-    if not on and danceTrack then
-        danceTrack:Stop()
-        danceTrack = nil
-    end
+    if not on then stopDance() end
 end)
 
 makeButton(mainPage, 100, "Сменить танец: " .. DANCES[1].name, function(btn)
     danceIndex = danceIndex % #DANCES + 1
     btn.Text = "Сменить танец: " .. DANCES[danceIndex].name
-    if danceTrack then danceTrack:Stop(); danceTrack = nil end
+    stopDance()
 end)
 
 makeToggle(mainPage, 140, "Noclip", false, function(on) noclipOn = on end)
@@ -383,8 +404,8 @@ RunService.Heartbeat:Connect(function()
 
     -- танец (постоянно, реплицируется на других игроков через Animator)
     if danceOn then
-        if not danceTrack or danceTrack.Parent == nil then
-            local animator = hum:FindFirstChildOfClass("Animator") or hum:WaitForChild("Animator", 2)
+        if not danceTrack then
+            local animator = hum:FindFirstChildOfClass("Animator")
             if animator then
                 local anim = Instance.new("Animation")
                 local isR6 = hum.RigType == Enum.HumanoidRigType.R6
