@@ -42,6 +42,7 @@ local CFG = {
     predict = true,       -- inflate zones of moving mines by their speed
     lookahead = 1.5,      -- seconds of movement to predict
     magnet = 5,           -- gift collection range added at round start (0 = off), like the old GUI
+    voidGuard = false,    -- teleport to spawn when falling into the void (can pin you to spawn if the void plane is high)
     avoidEnemies = false, -- treat enemies as obstacles when god mode is OFF
     showZones = false,    -- draw mine danger zones
     beaconWaitPassage = true,
@@ -418,6 +419,54 @@ end
 ------------------------------------------------------------------ gifts
 local blacklist = setmetatable({}, { __mode = "k" })
 
+-- Fallback discovery: any part that has a child named "Collect" anywhere in Workspace is a gift.
+-- Used when the Item_Pools folders are empty (level not generated / streamed yet / different folder).
+local foundGifts, foundWhere = {}, {}
+local lastScan, lastExplore, scanning = 0, 0, false
+
+local function scanWorkspaceForGifts()
+    if scanning then return end
+    scanning = true
+    local list, where = {}, {}
+    local ok, desc = pcall(function() return workspace:GetDescendants() end)
+    if ok then
+        for i, d in ipairs(desc) do
+            if d.Name == "Collect" then
+                local par = d.Parent
+                if par and par:IsA("BasePart") and par.Transparency ~= 1 then
+                    list[#list + 1] = par
+                    local key = par.Parent and par.Parent:GetFullName() or "?"
+                    where[key] = (where[key] or 0) + 1
+                end
+            end
+            if i % 4000 == 0 then task.wait() end
+        end
+    end
+    foundGifts, foundWhere, lastScan = list, where, tick()
+    scanning = false
+end
+
+-- StreamingEnabled games only replicate parts near the player: ask the engine to stream the level
+local function exploreStream()
+    if not workspace.StreamingEnabled then return end
+    local targets = {}
+    local b = workspace:FindFirstChild("Beacon")
+    if b then
+        local ok, pos = pcall(function() return b:IsA("Model") and b:GetPivot().Position or b.Position end)
+        if ok then targets[#targets + 1] = pos end
+    end
+    for _, r in ipairs(currentRooms:GetChildren()) do
+        local ok, pos = pcall(function() return r:GetPivot().Position end)
+        if ok then targets[#targets + 1] = pos end
+        if #targets >= 40 then break end
+    end
+    logEvent("streaming enabled: requesting level around " .. #targets .. " points")
+    for _, pos in ipairs(targets) do
+        if not running then return end
+        pcall(function() plr:RequestStreamAroundAsync(pos, 2) end)
+    end
+end
+
 local function pickCandidates(root, useNormal, useGolden, limit)
     local rp = root.Position
     local best = {}
@@ -443,6 +492,17 @@ local function pickCandidates(root, useNormal, useGolden, limit)
     end
     if useNormal then scan(gifts) end
     if useGolden then scan(goldengifts) end
+    for _, g in ipairs(foundGifts) do
+        if g.Parent and g.Parent ~= gifts and g.Parent ~= goldengifts and g.Transparency ~= 1
+            and not (blacklist[g] and blacklist[g] > tick()) then
+            local nm = (g.Name .. " " .. g.Parent.Name):lower()
+            local golden = nm:find("golden", 1, true) ~= nil
+            if (golden and useGolden) or (not golden and useNormal) then
+                local d = (g.Position - rp).Magnitude
+                if (#best < limit or d < best[#best].d) and g:FindFirstChild("Collect") then consider(g, d) end
+            end
+        end
+    end
     return best
 end
 
@@ -583,6 +643,22 @@ local function diagGifts()
     else
         out[#out + 1] = "no character root"
     end
+    if tick() - lastScan > 3 then pcall(scanWorkspaceForGifts) end
+    local kv = workspace:FindFirstChild("KillVoid")
+    out[#out + 1] = string.format("streaming=%s | rooms=%d | KillVoid.Y=%s | Spawn=%s | voidGuard=%s | missing=[%s]",
+        tostring(workspace.StreamingEnabled), #currentRooms:GetChildren(),
+        kv and string.format("%.0f", kv.Position.Y) or "nil",
+        spawnPart and string.format("(%.0f,%.0f,%.0f)", spawnPart.Position.X, spawnPart.Position.Y, spawnPart.Position.Z) or "nil",
+        tostring(CFG.voidGuard), table.concat(missing, ", "))
+    local pools = {}
+    for _, c in ipairs(items:GetChildren()) do
+        if #pools >= 15 then pools[#pools + 1] = "..." break end
+        pools[#pools + 1] = c.Name .. "(" .. c.ClassName .. ":" .. #c:GetChildren() .. ")"
+    end
+    out[#out + 1] = "Item_Pools children: " .. table.concat(pools, ", ")
+    local fw = {}
+    for k, v in pairs(foundWhere) do fw[#fw + 1] = k .. "=" .. v end
+    out[#out + 1] = "workspace scan, parts with a 'Collect' child: " .. (#fw > 0 and table.concat(fw, ", ") or "none")
     countGifts()
     out[#out + 1] = string.format("gifts in folder=%d collectable=%d | visits=%d collected=%d failed=%d unsafe=%d noRoute=%d",
         diag.total, diag.withCollect, diag.visits, diag.collected, diag.failed, diag.unsafe, diag.noRoute)
@@ -1215,6 +1291,7 @@ cfgToggle(pMain, "Auto pick in intermission  [C]", "choose")
 cfgToggle(pMain, "Auto go to beacon  [V]", "beacon")
 cfgToggle(pMain, "Collect ALL gifts (not only needed)", "collectAll")
 cfgToggle(pMain, "Wait for passage gifts before beacon", "beaconWaitPassage")
+cfgToggle(pMain, "Void guard (back to spawn when falling)", "voidGuard")
 addSlider(pMain, "Move speed (studs/s)", "speed", 40, 200, 5, "%d")
 addSlider(pMain, "Gift range at round start (0 = off)", "magnet", 0, 30, 1, "%d")
 addButton(pMain, "Apply gift range now", function() applyMagnet() end)
@@ -1225,7 +1302,7 @@ local stNeed = addLabel(pMain, "Needed: ...")
 local stMines = addLabel(pMain, "Mines: ...")
 local stAction = addLabel(pMain, "Action: ...")
 local stObjects = addLabel(pMain, "Objects: ...")
-local stGifts = addLabel(pMain, "Gifts: ...", 40)
+local stGifts = addLabel(pMain, "Gifts: ...", 54)
 local stLog = addLabel(pMain, "", 110)
 stLog.TextYAlignment = Enum.TextYAlignment.Top
 stLog.TextSize = 12
@@ -1441,8 +1518,8 @@ task.spawn(function()
             diag.countAt = tick()
             pcall(countGifts)
         end
-        stGifts.Text = string.format("Gifts in folder: %d (collectable %d) | collected: %d | failed: %d | skipped: mine zone %d, no route %d",
-            diag.total, diag.withCollect, diag.collected, diag.failed, diag.unsafe, diag.noRoute)
+        stGifts.Text = string.format("Gifts in folder: %d (collectable %d, found by scan %d) | collected: %d | failed: %d | skipped: mine zone %d, no route %d | level rooms: %d",
+            diag.total, diag.withCollect, #foundGifts, diag.collected, diag.failed, diag.unsafe, diag.noRoute, #currentRooms:GetChildren())
         stLog.Text = table.concat(diag.log, "\n")
         task.wait(0.4)
     end
@@ -1529,7 +1606,15 @@ task.spawn(function()
         if not did then
             if #cands == 0 then
                 state.action = "no gifts"
-                logEvent("no candidate gifts (all skipped or none collectable)")
+                local rooms = #currentRooms:GetChildren()
+                logEvent(string.format("no gifts known (rooms loaded: %d, streaming: %s)", rooms, tostring(workspace.StreamingEnabled)))
+                if rooms > 0 or tick() - roundStart > 20 then
+                    if tick() - lastScan > 4 and not scanning then task.spawn(scanWorkspaceForGifts) end
+                    if tick() - lastExplore > 12 then
+                        lastExplore = tick()
+                        task.spawn(exploreStream)
+                    end
+                end
             end
             task.wait(0.3)
         end
@@ -1633,7 +1718,7 @@ conns[#conns + 1] = RS.Heartbeat:Connect(function()
     if rb then rb:Destroy() end
 
     local kv = workspace:FindFirstChild("KillVoid")
-    if kv and spawnPart and root.Position.Y <= kv.Position.Y + 75 then
+    if CFG.voidGuard and kv and spawnPart and root.Position.Y <= kv.Position.Y + 75 and root.AssemblyLinearVelocity.Y < -30 then
         snap(root, hitbox, safeNear(spawnPart.Position + Vector3.new(0, 4, 0)))
         return
     end
