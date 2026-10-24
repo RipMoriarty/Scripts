@@ -11,6 +11,8 @@
       Z collect | X god | C auto pick | V beacon | B copy debug info | P stop
 ]]
 
+local __ok, __err = xpcall(function()
+
 if not game:IsLoaded() then game.Loaded:Wait() end
 
 local env = (getgenv and getgenv()) or _G
@@ -131,20 +133,34 @@ local function notify(text)
 end
 
 ------------------------------------------------------------------ game objects
-local items = workspace:WaitForChild("Item_Pools")
-local gifts = items:WaitForChild("Gift")
-local goldengifts = items:WaitForChild("GoldenGift")
-local tripmines = items:WaitForChild("Tripmine")
+notify("Nullscape GUI: loading...")
+
+local function waitFor(parent, name, timeout)
+    local obj = parent:FindFirstChild(name)
+    if obj then return obj end
+    notify("Waiting for " .. parent:GetFullName() .. "." .. name .. " ...")
+    obj = parent:WaitForChild(name, timeout or 20)
+    if not obj then
+        notify("NOT FOUND: " .. parent:GetFullName() .. "." .. name .. " (run the script inside a Nullscape match)")
+        error("missing object: " .. parent:GetFullName() .. "." .. name, 0)
+    end
+    return obj
+end
+
+local items = waitFor(workspace, "Item_Pools")
+local gifts = waitFor(items, "Gift")
+local goldengifts = waitFor(items, "GoldenGift")
+local tripmines = waitFor(items, "Tripmine")
 local goldtrip = items:FindFirstChild("GoldTripmines")
 local bullets = items:FindFirstChild("Bullet")
-local enemies = workspace:WaitForChild("Enemies")
+local enemies = waitFor(workspace, "Enemies")
 local skinwalkers = workspace:FindFirstChild("Skinwalkers")
-local currentRooms = workspace:WaitForChild("CurrentRooms")
-local pads = workspace:WaitForChild("JumpPads")
+local currentRooms = waitFor(workspace, "CurrentRooms")
+local pads = waitFor(workspace, "JumpPads")
 local destroyFolder = workspace:FindFirstChild("DestroyFolder")
 local spawnPart = workspace:FindFirstChild("Spawn")
-local inRound = ReplicatedStorage:WaitForChild("InRound")
-local counters = ReplicatedStorage:WaitForChild("GiftCounters")
+local inRound = waitFor(ReplicatedStorage, "InRound")
+local counters = waitFor(ReplicatedStorage, "GiftCounters")
 
 local exiting = false
 local roundStart = inRound.Value and (tick() - 100) or 0
@@ -1447,3 +1463,22 @@ task.spawn(function()
 end)
 
 notify("Nullscape GUI loaded. RightShift = show/hide")
+
+end, function(e)
+    return tostring(e) .. "\n" .. debug.traceback()
+end)
+
+if not __ok then
+    warn("[NullscapeGUI] ERROR: " .. tostring(__err))
+    pcall(function()
+        game:GetService("StarterGui"):SetCore("SendNotification", {
+            Title = "Nullscape GUI - error",
+            Text = tostring(__err):sub(1, 180),
+            Duration = 12,
+        })
+    end)
+    pcall(function()
+        local clip = setclipboard or toclipboard or set_clipboard
+        if clip then clip(tostring(__err)) end
+    end)
+end
