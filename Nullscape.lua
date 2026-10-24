@@ -41,7 +41,8 @@ local CFG = {
     mineMargin = 4,       -- extra safety distance around every mine
     predict = true,       -- inflate zones of moving mines by their speed
     lookahead = 1.5,      -- seconds of movement to predict
-    avoidEnemies = true,  -- treat enemies as obstacles when god mode is OFF
+    magnet = 5,           -- gift collection range added at round start (0 = off), like the old GUI
+    avoidEnemies = false, -- treat enemies as obstacles when god mode is OFF
     showZones = false,    -- draw mine danger zones
     beaconWaitPassage = true,
     noNeedGrace = 25,
@@ -65,16 +66,25 @@ local TYPE_ORDER = { "ENEMIES", "CURSES", "UPGRADES" }
 local running = true
 local conns = {}
 local state = { action = "idle" }
+local diag = { total = 0, withCollect = 0, visits = 0, collected = 0, failed = 0, unsafe = 0, noRoute = 0, countAt = 0, log = {} }
+
+local function logEvent(text)
+    local log = diag.log
+    local stamp = os.date("%H:%M:%S")
+    if log[#log] and log[#log]:sub(10) == text then return end
+    log[#log + 1] = stamp .. " " .. text
+    while #log > 7 do table.remove(log, 1) end
+end
 local breakPicks = { ENEMIES = 0, CURSES = 0, UPGRADES = 0 }
 local UI = {}  -- filled by the GUI builder (refresh hooks)
 
 ------------------------------------------------------------------ save / load
 local SAVE_FILE = "NullscapeGUI.json"
-local SAVED_CFG_KEYS = { "collect", "god", "choose", "beacon", "collectAll", "speed", "mineMargin",
-    "predict", "lookahead", "avoidEnemies", "beaconWaitPassage" }
+local SAVED_CFG_KEYS = { "collectAll", "speed", "mineMargin", "predict", "lookahead",
+    "avoidEnemies", "beaconWaitPassage", "magnet" }
 
 local function serialize()
-    local t = { cfg = {}, picks = {} }
+    local t = { v = 4, cfg = {}, picks = {} }
     for _, k in ipairs(SAVED_CFG_KEYS) do t.cfg[k] = CFG[k] end
     for typ, p in pairs(PICKS) do
         local es = {}
@@ -101,7 +111,7 @@ local function loadSaved()
         return HttpService:JSONDecode(readfile(SAVE_FILE))
     end)
     if not ok or type(data) ~= "table" then return end
-    if type(data.cfg) == "table" then
+    if data.v == 4 and type(data.cfg) == "table" then
         for _, k in ipairs(SAVED_CFG_KEYS) do
             if data.cfg[k] ~= nil and type(data.cfg[k]) == type(CFG[k]) then CFG[k] = data.cfg[k] end
         end
@@ -209,6 +219,40 @@ local function need(name)
     return (c and tonumber(c.Value)) or 0
 end
 
+-- gift collection range (same BindableEvent the old GUI used)
+local magnetApplied = false
+local function getMagnet()
+    local ev = ReplicatedStorage:FindFirstChild("Events")
+    local m = ev and ev:FindFirstChild("MovementGiftMagnet")
+    if m and m:IsA("BindableEvent") then return m end
+    return nil
+end
+
+local function applyMagnet()
+    if CFG.magnet <= 0 then return end
+    pcall(function()
+        local m = getMagnet()
+        if m then
+            m:Fire({ Add = CFG.magnet })
+            magnetApplied = true
+            logEvent("gift range +" .. CFG.magnet .. " applied")
+        else
+            logEvent("MovementGiftMagnet event not found")
+        end
+    end)
+end
+
+local function resetMagnet(full)
+    pcall(function()
+        local m = getMagnet()
+        if m then
+            m:Fire({ Add = 1 })
+            m:Fire({ Reset = full and math.huge or 1 })
+            magnetApplied = false
+        end
+    end)
+end
+
 ------------------------------------------------------------------ obstacles (mines) tracking
 local obstacles = {}
 local obsState = setmetatable({}, { __mode = "k" })
@@ -236,7 +280,9 @@ local function trackPart(part, dt, origin, list)
         st.pos = pos
     end
     local speed = st.vel.Magnitude
-    st.reff = part.Size.Magnitude / 2 + pRad + CFG.mineMargin + ((CFG.predict and speed * CFG.lookahead) or 0)
+    local grow = 0
+    if CFG.predict then grow = math.min(speed * CFG.lookahead, 12) end
+    st.reff = math.min(part.Size.Magnitude / 2, 30) + pRad + CFG.mineMargin + grow
     if speed > 0 then movingCount += 1 end
     list[#list + 1] = st
 end
@@ -454,7 +500,12 @@ local function followRoute(route, g)
 end
 
 -- returns true if it did something (so the caller moves on), false if the gift was rejected
+local function stillThere(g)
+    return g.Parent ~= nil and g.Transparency ~= 1 and g:FindFirstChild("Collect", true) ~= nil
+end
+
 local function visit(g)
+    diag.visits += 1
     for _ = 1, 4 do
         local _, root = charParts()
         if not root then return false end
@@ -464,6 +515,8 @@ local function visit(g)
 
         if not pointSafe(target, obs) then
             blacklist[g] = tick() + 3
+            diag.unsafe += 1
+            logEvent("skipped gift: inside a mine zone")
             return false
         end
 
@@ -472,6 +525,8 @@ local function visit(g)
         if not route then
             blacklist[g] = tick() + 4
             state.action = "no safe route"
+            diag.noRoute += 1
+            logEvent("skipped gift: no safe route around mines")
             return false
         end
 
@@ -480,11 +535,20 @@ local function visit(g)
         if res == "abort" then return true end
         if res == "done" then
             local t0 = tick()
-            while g.Parent and g.Transparency ~= 1 and g:FindFirstChild("Collect", true) and tick() - t0 < 0.5 do
-                task.wait(0.03)
+            while stillThere(g) and tick() - t0 < 0.6 do task.wait(0.03) end
+            if stillThere(g) then
+                -- touch did not register: put root + hitbox exactly on the gift once more
+                local _, r2, h2 = charParts()
+                if r2 then snap(r2, h2, g.Position) end
+                t0 = tick()
+                while stillThere(g) and tick() - t0 < 0.5 do task.wait(0.03) end
             end
-            if g.Parent and g.Transparency ~= 1 and g:FindFirstChild("Collect", true) then
+            if stillThere(g) then
                 blacklist[g] = tick() + 8
+                diag.failed += 1
+                logEvent("reached gift but it was NOT collected")
+            else
+                diag.collected += 1
             end
             return true
         end
@@ -492,6 +556,61 @@ local function visit(g)
     end
     blacklist[g] = tick() + 6
     return true
+end
+
+------------------------------------------------------------------ diagnostics
+local function countGifts()
+    local total, withC = 0, 0
+    for _, f in ipairs({ gifts, goldengifts }) do
+        for _, g in ipairs(f:GetChildren()) do
+            total += 1
+            if g:IsA("BasePart") and g.Transparency ~= 1 and g:FindFirstChild("Collect", true) then withC += 1 end
+        end
+    end
+    diag.total, diag.withCollect = total, withC
+end
+
+local function diagGifts()
+    updateObstacles(true)
+    local out = {}
+    local _, root, hb = charParts()
+    out[#out + 1] = string.format("toggles: collect=%s god=%s choose=%s beacon=%s | exiting=%s | magnet=%s | avoidEnemies=%s",
+        tostring(CFG.collect), tostring(CFG.god), tostring(CFG.choose), tostring(CFG.beacon),
+        tostring(exiting), tostring(CFG.magnet), tostring(CFG.avoidEnemies))
+    if root then
+        out[#out + 1] = string.format("root=(%.0f,%.0f,%.0f) hitbox-offset=%.2f",
+            root.Position.X, root.Position.Y, root.Position.Z, hb and (hb.Position - root.Position).Magnitude or -1)
+    else
+        out[#out + 1] = "no character root"
+    end
+    countGifts()
+    out[#out + 1] = string.format("gifts in folder=%d collectable=%d | visits=%d collected=%d failed=%d unsafe=%d noRoute=%d",
+        diag.total, diag.withCollect, diag.visits, diag.collected, diag.failed, diag.unsafe, diag.noRoute)
+    for i, o in ipairs(obstacles) do
+        if i > 12 then break end
+        local part = o.part
+        local d = root and (o.pos - root.Position).Magnitude or -1
+        out[#out + 1] = string.format("obstacle %d: %s (%s) in %s size=%.1f dist=%.0f speed=%.1f zone=%.1f",
+            i, part.Name, part.ClassName, part.Parent and part.Parent.Name or "?", part.Size.Magnitude, d, o.vel.Magnitude, o.reff or 0)
+    end
+    if root then
+        local cands = pickCandidates(root, true, true, 6)
+        for i, c in ipairs(cands) do
+            local g = c.g
+            local obs = relevant(root.Position, g.Position, obstacles)
+            local safe = pointSafe(g.Position, obs)
+            local route = nil
+            if safe then
+                routeBudget = 4000
+                route = findRoute(root.Position, g.Position, obs, 4)
+            end
+            out[#out + 1] = string.format("gift %d: %s dist=%.0f safe=%s route=%s",
+                i, g.Name, c.d, tostring(safe), route and (#route .. " pts") or "none")
+        end
+        if #cands == 0 then out[#out + 1] = "no candidate gifts (filtered, blacklisted or folder empty)" end
+    end
+    for _, l in ipairs(diag.log) do out[#out + 1] = "log: " .. l end
+    return table.concat(out, "\n")
 end
 
 ------------------------------------------------------------------ god mode
@@ -526,21 +645,40 @@ end
 
 ------------------------------------------------------------------ altars / picking
 local IMAGES = {
-    ["rbxassetid://90968042204988"] = "ENEMIES",
-    ["rbxassetid://71252790926685"] = "CURSES",
-    ["rbxassetid://109624131383272"] = "UPGRADES",
+    ["90968042204988"] = "ENEMIES",
+    ["71252790926685"] = "CURSES",
+    ["109624131383272"] = "UPGRADES",
 }
 
-local function intermissionType()
+local function signImage()
     local sel = workspace:FindFirstChild("Select")
     local sign = sel and sel:FindFirstChild("Sign")
     local bb = sign and sign:FindFirstChild("Billboard")
     local img = bb and bb:FindFirstChild("ImageLabel")
-    return img and IMAGES[img.Image] or nil
+    return sel, img and tostring(img.Image) or nil
+end
+
+-- ENEMIES / CURSES / UPGRADES, "UNKNOWN" if the sign image is not recognised, nil if there is no Select model
+local function intermissionType()
+    local sel, image = signImage()
+    if not sel then return nil end
+    local id = image and image:match("%d+")
+    return (id and IMAGES[id]) or "UNKNOWN"
+end
+
+local function stripTags(str)
+    return (tostring(str or ""):gsub("<[^>]->", ""))
 end
 
 local function promptText(p)
-    return ((p.ObjectText or "") .. " " .. (p.ActionText or "")):lower()
+    return stripTags((p.ObjectText or "") .. " " .. (p.ActionText or "")):lower()
+end
+
+-- the altar name: ActionText for break altars ("shotgun"), cleaned of rich text
+local function altarName(p)
+    local n = stripTags(p.ActionText):lower():match("^%s*(.-)%s*$")
+    if n == "" then n = stripTags(p.ObjectText):lower():match("^%s*(.-)%s*$") end
+    return n
 end
 
 local function collectPrompts()
@@ -567,10 +705,10 @@ local function matchesAny(text, csv)
     return false
 end
 
--- returns prompt, entry (entry is nil when picked via "pick any")
-local function choose(prompts, typ)
-    local cfg = PICKS[typ]
-    if not cfg or cfg.perBreak <= 0 or breakPicks[typ] >= cfg.perBreak then return nil end
+-- returns prompt, entry (nil when picked via "pick any"), category
+local function chooseIn(prompts, cat, allowAny)
+    local cfg = PICKS[cat]
+    if not cfg or cfg.perBreak <= 0 or breakPicks[cat] >= cfg.perBreak then return nil end
     local free = {}
     for _, p in ipairs(prompts) do
         if not (used[p] and tick() - used[p] < 20) then free[#free + 1] = p end
@@ -578,15 +716,31 @@ local function choose(prompts, typ)
     for _, e in ipairs(cfg.entries) do
         if e.max == 0 or e.used < e.max then
             for _, p in ipairs(free) do
+                if altarName(p):find(e.text, 1, true) then return p, e end
+            end
+            for _, p in ipairs(free) do
                 if promptText(p):find(e.text, 1, true) then return p, e end
             end
         end
     end
-    if cfg.any then
+    if allowAny and cfg.any then
         for _, p in ipairs(free) do
             if not matchesAny(promptText(p), cfg.avoid) then return p, nil end
         end
     end
+    return nil
+end
+
+local function choose(prompts, typ)
+    if typ == "UNKNOWN" then
+        for _, cat in ipairs(TYPE_ORDER) do
+            local p, e = chooseIn(prompts, cat, false)
+            if p then return p, e, cat end
+        end
+        return nil
+    end
+    local p, e = chooseIn(prompts, typ, true)
+    if p then return p, e, typ end
     return nil
 end
 
@@ -632,7 +786,12 @@ end
 local function goBeacon()
     local b = workspace:FindFirstChild("Beacon")
     local _, root, hitbox = charParts()
-    if not b or not root then return end
+    if not b then
+        logEvent("Beacon object not found in Workspace")
+        notify("Beacon not found in Workspace")
+        return
+    end
+    if not root then return end
     local pos = b:IsA("Model") and b:GetPivot().Position or b.Position
     snap(root, hitbox, safeNear(pos + Vector3.new(0, 4, 0)))
 end
@@ -648,7 +807,8 @@ end
 local function dumpInfo()
     updateObstacles(true)
     local lines = {}
-    lines[#lines + 1] = "InRound: " .. tostring(inRound.Value) .. " | type: " .. tostring(intermissionType())
+    local _, rawImg = signImage()
+    lines[#lines + 1] = "InRound: " .. tostring(inRound.Value) .. " | type: " .. tostring(intermissionType()) .. " | sign image: " .. tostring(rawImg)
     lines[#lines + 1] = string.format("Needed: Gift=%s Golden=%s Passage=%s Tripmine=%s",
         need("Gift"), need("GoldenGift"), need("PassageGift"), need("Tripmine"))
     lines[#lines + 1] = string.format("Obstacles tracked: %d (moving: %d), player radius: %.1f",
@@ -664,6 +824,9 @@ local function dumpInfo()
     lines[#lines + 1] = "Active greater curses: " .. names(f("GreaterCurseFolder", "Curses"))
     lines[#lines + 1] = "Active upgrades: " .. names(f("UpgradeFolder", "Upgrades"))
     lines[#lines + 1] = "Enemies now: " .. names(enemies)
+    lines[#lines + 1] = "---- gift diagnostics ----"
+    local okD, dtext = pcall(diagGifts)
+    lines[#lines + 1] = okD and dtext or ("diagnostics error: " .. tostring(dtext))
     local text = table.concat(lines, "\n")
     print("[NullscapeGUI] ---- dump ----\n" .. text)
     local clip = setclipboard or toclipboard or set_clipboard
@@ -1053,12 +1216,21 @@ cfgToggle(pMain, "Auto go to beacon  [V]", "beacon")
 cfgToggle(pMain, "Collect ALL gifts (not only needed)", "collectAll")
 cfgToggle(pMain, "Wait for passage gifts before beacon", "beaconWaitPassage")
 addSlider(pMain, "Move speed (studs/s)", "speed", 40, 200, 5, "%d")
+addSlider(pMain, "Gift range at round start (0 = off)", "magnet", 0, 30, 1, "%d")
+addButton(pMain, "Apply gift range now", function() applyMagnet() end)
+addButton(pMain, "Reset gift range", function() resetMagnet(false) end)
 section(pMain, "Status")
 local stRound = addLabel(pMain, "Round: ...")
 local stNeed = addLabel(pMain, "Needed: ...")
 local stMines = addLabel(pMain, "Mines: ...")
 local stAction = addLabel(pMain, "Action: ...")
 local stObjects = addLabel(pMain, "Objects: ...")
+local stGifts = addLabel(pMain, "Gifts: ...", 40)
+local stLog = addLabel(pMain, "", 110)
+stLog.TextYAlignment = Enum.TextYAlignment.Top
+stLog.TextSize = 12
+addButton(pMain, "Teleport to beacon now", function() pcall(goBeacon) end)
+addButton(pMain, "Copy full diagnostics to clipboard", dumpInfo)
 
 -- Mines
 section(pMines, "Mine avoidance")
@@ -1176,7 +1348,7 @@ local function buildPicksSection(typ)
         end
         local seen, n = {}, 0
         for _, p in ipairs(collectPrompts()) do
-            local t = ((p.ObjectText ~= "" and p.ObjectText) or p.ActionText or ""):lower():match("^%s*(.-)%s*$")
+            local t = altarName(p)
             if t ~= "" and not seen[t] then
                 seen[t] = true
                 n += 1
@@ -1244,6 +1416,7 @@ end)
 stop = function()
     if not running then return end
     running = false
+    if magnetApplied then resetMagnet(true) end
     for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
     pcall(function() zoneFolder:Destroy() end)
     pcall(function() sg:Destroy() end)
@@ -1264,6 +1437,13 @@ task.spawn(function()
         stMines.Text = string.format("Mines tracked: %d (moving: %d)", #obstacles, movingCount)
         stAction.Text = "Action: " .. state.action
         stObjects.Text = (#missing == 0) and "Objects: all found" or ("Not found yet: " .. table.concat(missing, ", "))
+        if tick() - diag.countAt > 1 then
+            diag.countAt = tick()
+            pcall(countGifts)
+        end
+        stGifts.Text = string.format("Gifts in folder: %d (collectable %d) | collected: %d | failed: %d | skipped: mine zone %d, no route %d",
+            diag.total, diag.withCollect, diag.collected, diag.failed, diag.unsafe, diag.noRoute)
+        stLog.Text = table.concat(diag.log, "\n")
         task.wait(0.4)
     end
 end)
@@ -1339,6 +1519,7 @@ task.spawn(function()
             local ok, res = pcall(visit, c.g)
             if not ok then
                 if CFG.debug then warn("[NullscapeGUI] visit error: " .. tostring(res)) end
+                logEvent("visit error: " .. tostring(res):sub(1, 70))
                 blacklist[c.g] = tick() + 5
             elseif res then
                 did = true
@@ -1346,7 +1527,10 @@ task.spawn(function()
             end
         end
         if not did then
-            if #cands == 0 then state.action = "no gifts" end
+            if #cands == 0 then
+                state.action = "no gifts"
+                logEvent("no candidate gifts (all skipped or none collectable)")
+            end
             task.wait(0.3)
         end
     end
@@ -1404,13 +1588,17 @@ local function rebind()
         lastRoundObj = inRound
         if conRound then conRound:Disconnect() conRound = nil end
         if inRound ~= FALLBACK_ROUND then
-            if inRound.Value then roundStart = tick() - 100 end
+            if inRound.Value then
+                roundStart = tick() - 100
+                task.defer(applyMagnet)
+            end
             conRound = inRound:GetPropertyChangedSignal("Value"):Connect(function()
                 if inRound.Value then
                     roundStart = tick()
                     sawNeed = false
                     exiting = false
                     lastExit = 0
+                    task.defer(applyMagnet)
                 else
                     for k in pairs(breakPicks) do breakPicks[k] = 0 end
                 end
@@ -1427,6 +1615,13 @@ task.spawn(function()
         pcall(refreshObjects)
         pcall(rebind)
     end
+end)
+
+-- keep the hitbox glued to the root every frame (the old GUI did this too; the game reads the hitbox)
+conns[#conns + 1] = RS.Heartbeat:Connect(function()
+    if not running then return end
+    local _, root, hb = charParts()
+    if root and hb then hb.Position = root.Position end
 end)
 
 conns[#conns + 1] = RS.Heartbeat:Connect(function()
@@ -1481,19 +1676,21 @@ task.spawn(function()
             local sig = typ .. "|" .. table.concat(parts, ";")
             if sig ~= lastSig then
                 lastSig = sig
-                print("[NullscapeGUI] break type: " .. typ)
+                local _, rawImg = signImage()
+                print("[NullscapeGUI] break type: " .. typ .. " (sign image: " .. tostring(rawImg) .. ")")
                 for i, t in ipairs(parts) do print("[NullscapeGUI]   altar " .. i .. ": " .. t) end
             end
         end
 
-        local p, entry = choose(prompts, typ)
+        local p, entry, cat = choose(prompts, typ)
         if p then
-            state.action = "picking altar (" .. typ .. ")"
+            state.action = "picking altar (" .. cat .. ")"
             local ok, res = pcall(activate, p)
             if ok and res then
-                breakPicks[typ] += 1
+                breakPicks[cat] += 1
                 if entry then entry.used += 1 end
-                if UI["render" .. typ] then UI["render" .. typ]() end
+                logEvent("picked altar: " .. altarName(p):sub(1, 40))
+                if UI["render" .. cat] then UI["render" .. cat]() end
             elseif not ok and CFG.debug then
                 warn("[NullscapeGUI] activate error: " .. tostring(res))
             end
@@ -1516,6 +1713,7 @@ task.spawn(function()
             exiting = true
             state.action = "going to beacon"
             notify("Requirements done, going to beacon")
+            logEvent("requirements done, going to beacon")
             pcall(goBeacon)
         end
     end
