@@ -33,58 +33,6 @@ local function getZombies()
     return list
 end
 
--- ===== Без коллизии / хитбокса (клиентская проверка) =====
--- Ставит CanCollide, CanTouch, CanQuery = false и запоминает старые значения
-local function makeGhost(getTargets, interval)
-    local orig = setmetatable({}, {__mode = "k"})
-    local conn
-    local acc = 0
-    local function apply()
-        for _, root in ipairs(getTargets()) do
-            for _, p in ipairs(root:GetDescendants()) do
-                if p:IsA("BasePart") then
-                    if not orig[p] then
-                        orig[p] = {p.CanCollide, p.CanTouch, p.CanQuery}
-                    end
-                    p.CanCollide = false
-                    p.CanTouch = false
-                    p.CanQuery = false
-                end
-            end
-        end
-    end
-    local function start()
-        if conn then return end
-        conn = RunService.Stepped:Connect(function(_, dt)
-            acc = acc + dt
-            if acc < interval then return end
-            acc = 0
-            apply()
-        end)
-    end
-    local function stop()
-        if conn then
-            conn:Disconnect()
-            conn = nil
-        end
-        for p, o in pairs(orig) do
-            if p.Parent then
-                p.CanCollide = o[1]
-                p.CanTouch = o[2]
-                p.CanQuery = o[3]
-            end
-        end
-        table.clear(orig)
-    end
-    return start, stop
-end
-
-local selfGhostStart, selfGhostStop = makeGhost(function()
-    return lp.Character and {lp.Character} or {}
-end, 0)
-
-local enemyGhostStart, enemyGhostStop = makeGhost(getZombies, 0.25)
-
 -- ===== Ноуклип =====
 local noclipConn
 local function startNoclip()
@@ -515,11 +463,11 @@ local function makeToggle(page, name, order, onFn, offFn)
     return b
 end
 
--- ===== ESP зомби =====
+-- ===== ESP зомби (папки по типам) =====
 local espOn = false
-local espTypes = {}   -- [имя] = {on, color, order, count, label}
+local espGroups = {}  -- [тип] = {on, color, order, expanded, variants, label, container}
 local espObjs = {}    -- [модель] = {hl, bb, txt}
-local typeOrder = 0
+local groupOrder = 0
 local MAX_HIGHLIGHTS = 30 -- лимит Roblox на одновременные Highlight около 31
 
 local palette = {
@@ -533,44 +481,145 @@ local palette = {
     Color3.fromRGB(230, 230, 230),
 }
 
-local function registerType(name)
-    typeOrder = typeOrder + 1
-    local infoT = {
-        on = true,
-        color = palette[(typeOrder - 1) % #palette + 1],
-        order = typeOrder,
-        count = 0,
-    }
-    espTypes[name] = infoT
+local WHITE = Color3.fromRGB(255, 255, 255)
+local GRAY = Color3.fromRGB(130, 130, 130)
+
+-- "Lurker3" -> "Lurker", "Zombie_12" -> "Zombie"
+local function baseName(name)
+    local b = string.gsub(name, "[%s_%-]*%d+$", "")
+    if b == "" then b = name end
+    return b
+end
+
+local function refreshGroup(g)
+    g.label.TextColor3 = g.on and WHITE or GRAY
+    for _, v in pairs(g.variants) do
+        v.label.TextColor3 = (g.on and v.on) and WHITE or GRAY
+    end
+end
+
+local function registerVariant(g, full)
+    local suffix = string.match(full, "(%d+)$")
+    local v = {on = true}
+    g.variants[full] = v
 
     local row = Instance.new("Frame")
-    row.Size = UDim2.new(1, -6, 0, 34)
-    row.LayoutOrder = typeOrder
-    row.BackgroundColor3 = Color3.fromRGB(35, 35, 42)
+    row.Size = UDim2.new(1, -22, 0, 28)
+    row.LayoutOrder = (tonumber(suffix) or 0) + 1
+    row.BackgroundColor3 = Color3.fromRGB(48, 48, 58)
     row.BorderSizePixel = 0
-    row.Parent = espPage
-    Instance.new("UICorner", row).CornerRadius = UDim.new(0, 8)
+    row.Visible = g.expanded
+    row.Parent = g.container
+    Instance.new("UICorner", row).CornerRadius = UDim.new(0, 6)
+    v.row = row
+
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(1, -76, 1, 0)
+    lbl.Position = UDim2.new(0, 8, 0, 0)
+    lbl.BackgroundTransparency = 1
+    lbl.Text = full .. " (0)"
+    lbl.Font = Enum.Font.Gotham
+    lbl.TextSize = 13
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.TextTruncate = Enum.TextTruncate.AtEnd
+    lbl.TextColor3 = WHITE
+    lbl.Parent = row
+    v.label = lbl
+
+    local tb = Instance.new("TextButton")
+    tb.Size = UDim2.new(0, 56, 0, 22)
+    tb.Position = UDim2.new(1, -62, 0.5, -11)
+    tb.BackgroundColor3 = GREEN
+    tb.Text = "ВКЛ"
+    tb.Font = Enum.Font.GothamMedium
+    tb.TextSize = 12
+    tb.TextColor3 = WHITE
+    tb.Parent = row
+    Instance.new("UICorner", tb).CornerRadius = UDim.new(0, 6)
+    tb.MouseButton1Click:Connect(function()
+        v.on = not v.on
+        tb.Text = v.on and "ВКЛ" or "ВЫКЛ"
+        tb.BackgroundColor3 = v.on and GREEN or RED
+        refreshGroup(g)
+    end)
+
+    refreshGroup(g)
+    return v
+end
+
+local function registerGroup(base)
+    groupOrder = groupOrder + 1
+    local g = {
+        on = true,
+        color = palette[(groupOrder - 1) % #palette + 1],
+        order = groupOrder,
+        expanded = false,
+        variants = {},
+    }
+    espGroups[base] = g
+
+    local cont = Instance.new("Frame")
+    cont.Size = UDim2.new(1, -6, 0, 0)
+    cont.AutomaticSize = Enum.AutomaticSize.Y
+    cont.BackgroundColor3 = Color3.fromRGB(35, 35, 42)
+    cont.BorderSizePixel = 0
+    cont.LayoutOrder = groupOrder
+    cont.Parent = espPage
+    Instance.new("UICorner", cont).CornerRadius = UDim.new(0, 8)
+    local lay = Instance.new("UIListLayout")
+    lay.Padding = UDim.new(0, 3)
+    lay.SortOrder = Enum.SortOrder.LayoutOrder
+    lay.HorizontalAlignment = Enum.HorizontalAlignment.Right
+    lay.Parent = cont
+    local pad = Instance.new("UIPadding")
+    pad.PaddingBottom = UDim.new(0, 4)
+    pad.Parent = cont
+    g.container = cont
+
+    local head = Instance.new("Frame")
+    head.Size = UDim2.new(1, 0, 0, 34)
+    head.LayoutOrder = 0
+    head.BackgroundTransparency = 1
+    head.Parent = cont
+
+    local arrow = Instance.new("TextButton")
+    arrow.Size = UDim2.new(0, 24, 0, 24)
+    arrow.Position = UDim2.new(0, 6, 0.5, -12)
+    arrow.BackgroundColor3 = Color3.fromRGB(55, 55, 66)
+    arrow.Text = "+"
+    arrow.Font = Enum.Font.GothamBold
+    arrow.TextSize = 16
+    arrow.TextColor3 = WHITE
+    arrow.Parent = head
+    Instance.new("UICorner", arrow).CornerRadius = UDim.new(0, 6)
+    arrow.MouseButton1Click:Connect(function()
+        g.expanded = not g.expanded
+        arrow.Text = g.expanded and "-" or "+"
+        for _, v in pairs(g.variants) do
+            v.row.Visible = g.expanded
+        end
+    end)
 
     local sw = Instance.new("Frame")
     sw.Size = UDim2.new(0, 6, 1, -12)
-    sw.Position = UDim2.new(0, 8, 0, 6)
-    sw.BackgroundColor3 = infoT.color
+    sw.Position = UDim2.new(0, 36, 0, 6)
+    sw.BackgroundColor3 = g.color
     sw.BorderSizePixel = 0
-    sw.Parent = row
+    sw.Parent = head
     Instance.new("UICorner", sw).CornerRadius = UDim.new(0, 3)
 
     local lbl = Instance.new("TextLabel")
-    lbl.Size = UDim2.new(1, -96, 1, 0)
-    lbl.Position = UDim2.new(0, 22, 0, 0)
+    lbl.Size = UDim2.new(1, -118, 1, 0)
+    lbl.Position = UDim2.new(0, 48, 0, 0)
     lbl.BackgroundTransparency = 1
-    lbl.Text = name .. " (0)"
-    lbl.Font = Enum.Font.GothamMedium
+    lbl.Text = base .. " (0)"
+    lbl.Font = Enum.Font.GothamBold
     lbl.TextSize = 14
     lbl.TextXAlignment = Enum.TextXAlignment.Left
     lbl.TextTruncate = Enum.TextTruncate.AtEnd
-    lbl.TextColor3 = Color3.fromRGB(255, 255, 255)
-    lbl.Parent = row
-    infoT.label = lbl
+    lbl.TextColor3 = WHITE
+    lbl.Parent = head
+    g.label = lbl
 
     local tb = Instance.new("TextButton")
     tb.Size = UDim2.new(0, 60, 0, 24)
@@ -579,17 +628,18 @@ local function registerType(name)
     tb.Text = "ВКЛ"
     tb.Font = Enum.Font.GothamMedium
     tb.TextSize = 13
-    tb.TextColor3 = Color3.fromRGB(255, 255, 255)
-    tb.Parent = row
+    tb.TextColor3 = WHITE
+    tb.Parent = head
     Instance.new("UICorner", tb).CornerRadius = UDim.new(0, 6)
     tb.MouseButton1Click:Connect(function()
-        infoT.on = not infoT.on
-        tb.Text = infoT.on and "ВКЛ" or "ВЫКЛ"
-        tb.BackgroundColor3 = infoT.on and GREEN or RED
+        g.on = not g.on
+        tb.Text = g.on and "ВКЛ" or "ВЫКЛ"
+        tb.BackgroundColor3 = g.on and GREEN or RED
+        refreshGroup(g)
     end)
 
-    print("[RM] новый тип зомби:", name)
-    return infoT
+    print("[RM] новый тип зомби:", base)
+    return g
 end
 
 local function clearObj(m)
@@ -603,26 +653,30 @@ end
 
 local function espStep()
     local myRoot = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
-    local counts = {}
+    local gcount, vcount = {}, {}
     local cands = {}
 
     for _, m in ipairs(getZombies()) do
         local hum = m:FindFirstChildOfClass("Humanoid")
         local part = m:FindFirstChild("HumanoidRootPart") or m.PrimaryPart or m:FindFirstChildWhichIsA("BasePart")
         if part and not (hum and hum.Health <= 0) then
-            local name = m.Name
-            local t = espTypes[name] or registerType(name)
-            counts[name] = (counts[name] or 0) + 1
-            if espOn and t.on then
+            local base = baseName(m.Name)
+            local g = espGroups[base] or registerGroup(base)
+            local v = g.variants[m.Name] or registerVariant(g, m.Name)
+            gcount[base] = (gcount[base] or 0) + 1
+            vcount[m.Name] = (vcount[m.Name] or 0) + 1
+            if espOn and g.on and v.on then
                 local d = myRoot and (myRoot.Position - part.Position).Magnitude or 0
-                table.insert(cands, {m = m, part = part, t = t, d = d, name = name})
+                table.insert(cands, {m = m, part = part, g = g, d = d, name = m.Name})
             end
         end
     end
 
-    for name, t in pairs(espTypes) do
-        t.count = counts[name] or 0
-        t.label.Text = name .. " (" .. t.count .. ")"
+    for base, g in pairs(espGroups) do
+        g.label.Text = base .. " (" .. (gcount[base] or 0) .. ")"
+        for full, v in pairs(g.variants) do
+            v.label.Text = full .. " (" .. (vcount[full] or 0) .. ")"
+        end
     end
 
     table.sort(cands, function(a, b) return a.d < b.d end)
@@ -654,7 +708,7 @@ local function espStep()
             o.txt = tl
         end
         o.bb.Adornee = c.part
-        o.txt.TextColor3 = c.t.color
+        o.txt.TextColor3 = c.g.color
         o.txt.Text = c.name .. " [" .. math.floor(c.d) .. "m]"
 
         if i <= MAX_HIGHLIGHTS then
@@ -667,8 +721,8 @@ local function espStep()
                 o.hl = hl
             end
             o.hl.Adornee = c.m
-            o.hl.FillColor = c.t.color
-            o.hl.OutlineColor = c.t.color
+            o.hl.FillColor = c.g.color
+            o.hl.OutlineColor = c.g.color
         elseif o.hl then
             o.hl:Destroy()
             o.hl = nil
@@ -695,8 +749,6 @@ makeToggle(espPage, "ESP зомби", 0, function() espOn = true end, function()
 makeToggle(mainPage, "Бессмертие", 1,
     function() god = true enableGod() end,
     function() god = false disableGod() end)
-makeToggle(mainPage, "Без коллизии (я)", 2, selfGhostStart, selfGhostStop)
-makeToggle(mainPage, "Без коллизии (враги)", 3, enemyGhostStart, enemyGhostStop)
 makeToggle(mainPage, "Подняться", 4, goUp, goDown)
 makeToggle(mainPage, "Ноуклип", 5, startNoclip, stopNoclip)
 makeToggle(mainPage, "Ночное зрение", 6, startNV, stopNV)
@@ -746,8 +798,6 @@ local function unload()
     pcall(goDown)
     pcall(stopNV)
     pcall(stopStamina)
-    pcall(selfGhostStop)
-    pcall(enemyGhostStop)
     espOn = false
     if espLoop then espLoop:Disconnect() end
     if bindConn then bindConn:Disconnect() end
