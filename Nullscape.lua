@@ -135,32 +135,52 @@ end
 ------------------------------------------------------------------ game objects
 notify("Nullscape GUI: loading...")
 
-local function waitFor(parent, name, timeout)
-    local obj = parent:FindFirstChild(name)
-    if obj then return obj end
-    notify("Waiting for " .. parent:GetFullName() .. "." .. name .. " ...")
-    obj = parent:WaitForChild(name, timeout or 20)
-    if not obj then
-        notify("NOT FOUND: " .. parent:GetFullName() .. "." .. name .. " (run the script inside a Nullscape match)")
-        error("missing object: " .. parent:GetFullName() .. "." .. name, 0)
-    end
-    return obj
-end
+-- Everything is resolved lazily: the GUI opens even if some folders do not exist yet
+-- (the game may create them only when a round starts). A missing folder is replaced
+-- by an empty placeholder and picked up automatically as soon as it appears.
+local EMPTY = Instance.new("Folder")
+EMPTY.Name = "NullscapeEmpty"
+local FALLBACK_ROUND = Instance.new("BoolValue")
 
-local items = waitFor(workspace, "Item_Pools")
-local gifts = waitFor(items, "Gift")
-local goldengifts = waitFor(items, "GoldenGift")
-local tripmines = waitFor(items, "Tripmine")
-local goldtrip = items:FindFirstChild("GoldTripmines")
-local bullets = items:FindFirstChild("Bullet")
-local enemies = waitFor(workspace, "Enemies")
-local skinwalkers = workspace:FindFirstChild("Skinwalkers")
-local currentRooms = waitFor(workspace, "CurrentRooms")
-local pads = waitFor(workspace, "JumpPads")
-local destroyFolder = workspace:FindFirstChild("DestroyFolder")
-local spawnPart = workspace:FindFirstChild("Spawn")
-local inRound = waitFor(ReplicatedStorage, "InRound")
-local counters = waitFor(ReplicatedStorage, "GiftCounters")
+local items, gifts, goldengifts, tripmines, goldtrip, bullets = EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY
+local enemies, skinwalkers, currentRooms, pads, destroyFolder = EMPTY, EMPTY, EMPTY, EMPTY, EMPTY
+local spawnPart = nil
+local inRound = FALLBACK_ROUND
+local counters = EMPTY
+local missing = {}
+
+local function refreshObjects()
+    local m = {}
+    local function get(parent, name, label)
+        local o = nil
+        if parent ~= EMPTY then o = parent:FindFirstChild(name) end
+        if not o then m[#m + 1] = label end
+        return o
+    end
+    local function opt(parent, name)
+        if parent == EMPTY then return EMPTY end
+        return parent:FindFirstChild(name) or EMPTY
+    end
+    items = get(workspace, "Item_Pools", "Item_Pools") or EMPTY
+    gifts = get(items, "Gift", "Item_Pools.Gift") or EMPTY
+    goldengifts = get(items, "GoldenGift", "Item_Pools.GoldenGift") or EMPTY
+    tripmines = get(items, "Tripmine", "Item_Pools.Tripmine") or EMPTY
+    goldtrip = opt(items, "GoldTripmines")
+    bullets = opt(items, "Bullet")
+    enemies = get(workspace, "Enemies", "Enemies") or EMPTY
+    skinwalkers = opt(workspace, "Skinwalkers")
+    currentRooms = get(workspace, "CurrentRooms", "CurrentRooms") or EMPTY
+    pads = get(workspace, "JumpPads", "JumpPads") or EMPTY
+    destroyFolder = opt(workspace, "DestroyFolder")
+    spawnPart = workspace:FindFirstChild("Spawn")
+    inRound = get(ReplicatedStorage, "InRound", "InRound") or FALLBACK_ROUND
+    counters = get(ReplicatedStorage, "GiftCounters", "GiftCounters") or EMPTY
+    missing = m
+end
+refreshObjects()
+if #missing > 0 then
+    notify("Not found yet: " .. table.concat(missing, ", ") .. " (the GUI works anyway and picks them up when they appear)")
+end
 
 local exiting = false
 local roundStart = inRound.Value and (tick() - 100) or 0
@@ -1038,6 +1058,7 @@ local stRound = addLabel(pMain, "Round: ...")
 local stNeed = addLabel(pMain, "Needed: ...")
 local stMines = addLabel(pMain, "Mines: ...")
 local stAction = addLabel(pMain, "Action: ...")
+local stObjects = addLabel(pMain, "Objects: ...")
 
 -- Mines
 section(pMines, "Mine avoidance")
@@ -1242,6 +1263,7 @@ task.spawn(function()
             need("Gift"), need("GoldenGift"), need("PassageGift"), need("Tripmine"))
         stMines.Text = string.format("Mines tracked: %d (moving: %d)", #obstacles, movingCount)
         stAction.Text = "Action: " .. state.action
+        stObjects.Text = (#missing == 0) and "Objects: all found" or ("Not found yet: " .. table.concat(missing, ", "))
         task.wait(0.4)
     end
 end)
@@ -1344,19 +1366,68 @@ task.spawn(function()
     end
 end)
 
-conns[#conns + 1] = enemies.ChildAdded:Connect(function(e)
-    if CFG.god then task.defer(killEnemy, e) end
+local conEnemies, conSkin, conDestroy, conRound
+local lastEnemies, lastSkin, lastDestroy, lastRoundObj
+
+local function rebind()
+    if enemies ~= lastEnemies then
+        lastEnemies = enemies
+        if conEnemies then conEnemies:Disconnect() conEnemies = nil end
+        if enemies ~= EMPTY then
+            conEnemies = enemies.ChildAdded:Connect(function(e)
+                if CFG.god then task.defer(killEnemy, e) end
+            end)
+            conns[#conns + 1] = conEnemies
+        end
+    end
+    if skinwalkers ~= lastSkin then
+        lastSkin = skinwalkers
+        if conSkin then conSkin:Disconnect() conSkin = nil end
+        if skinwalkers ~= EMPTY then
+            conSkin = skinwalkers.ChildAdded:Connect(function(e)
+                if CFG.god then task.defer(killEnemy, e) end
+            end)
+            conns[#conns + 1] = conSkin
+        end
+    end
+    if destroyFolder ~= lastDestroy then
+        lastDestroy = destroyFolder
+        if conDestroy then conDestroy:Disconnect() conDestroy = nil end
+        if destroyFolder ~= EMPTY then
+            conDestroy = destroyFolder.ChildAdded:Connect(function(c)
+                if CFG.god and c.Name == "VoidExplosion" then c:Destroy() end
+            end)
+            conns[#conns + 1] = conDestroy
+        end
+    end
+    if inRound ~= lastRoundObj then
+        lastRoundObj = inRound
+        if conRound then conRound:Disconnect() conRound = nil end
+        if inRound ~= FALLBACK_ROUND then
+            if inRound.Value then roundStart = tick() - 100 end
+            conRound = inRound:GetPropertyChangedSignal("Value"):Connect(function()
+                if inRound.Value then
+                    roundStart = tick()
+                    sawNeed = false
+                    exiting = false
+                    lastExit = 0
+                else
+                    for k in pairs(breakPicks) do breakPicks[k] = 0 end
+                end
+            end)
+            conns[#conns + 1] = conRound
+        end
+    end
+end
+
+pcall(rebind)
+task.spawn(function()
+    while running do
+        task.wait(1)
+        pcall(refreshObjects)
+        pcall(rebind)
+    end
 end)
-if skinwalkers then
-    conns[#conns + 1] = skinwalkers.ChildAdded:Connect(function(e)
-        if CFG.god then task.defer(killEnemy, e) end
-    end)
-end
-if destroyFolder then
-    conns[#conns + 1] = destroyFolder.ChildAdded:Connect(function(c)
-        if CFG.god and c.Name == "VoidExplosion" then c:Destroy() end
-    end)
-end
 
 conns[#conns + 1] = RS.Heartbeat:Connect(function()
     if not running or not CFG.god then return end
@@ -1390,18 +1461,6 @@ conns[#conns + 1] = RS.Heartbeat:Connect(function()
                 end
             end
         end
-    end
-end)
-
--- round state
-conns[#conns + 1] = inRound:GetPropertyChangedSignal("Value"):Connect(function()
-    if inRound.Value then
-        roundStart = tick()
-        sawNeed = false
-        exiting = false
-        lastExit = 0
-    else
-        for k in pairs(breakPicks) do breakPicks[k] = 0 end
     end
 end)
 
