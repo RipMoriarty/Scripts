@@ -8,6 +8,9 @@
 -- ================== НАСТРОЙКИ ==================
 local RUN_MAX = 4              -- максимум множителя скорости (x)
 local DANCES = {               -- стандартные танцы Roblox, тип рига определяется автоматически
+    -- Rambunctious: эмоция из каталога (ID предмета 108128682361404). Она рассчитана на R15;
+    -- на R6 вместо неё играет обычный R6-танец. Если анимация не грузится, подставь её ID в r15.
+    {name = "Rambunctious", r6 = "rbxassetid://182435998", r15 = "rbxassetid://108128682361404", resolve = true},
     {name = "Dance 1", r6 = "rbxassetid://182435998", r15 = "rbxassetid://507771019"},
     {name = "Dance 2", r6 = "rbxassetid://182436842", r15 = "rbxassetid://507776043"},
     {name = "Dance 3", r6 = "rbxassetid://182436935", r15 = "rbxassetid://507777268"},
@@ -28,7 +31,7 @@ local EXCLUDE_ANCESTOR_WORDS = {"decor", "deco", "prop", "fake", "background", "
 local OBJECT_PATTERNS = {
     Generators = {"generator"},
     Pallets    = {"pallet"},
-    Windows    = {"window"},
+    Windows    = {"window", "vault"},
 }
 -- Слова в названии команды/роли, по которым определяется киллер
 local KILLER_WORDS = {"killer", "murderer", "maniac"}
@@ -410,19 +413,48 @@ local function hookHumanoid(hum)
     end)
 end
 
-RunService.Heartbeat:Connect(function()
+-- Для эмоций из каталога пробуем достать настоящий ID анимации через GetObjects
+local resolvedAnims = {}
+local function resolveAnimId(raw)
+    if resolvedAnims[raw] then return end
+    resolvedAnims[raw] = raw
+    pcall(function()
+        local objs = game:GetObjects(raw)
+        local o = objs and objs[1]
+        if o then
+            local a = o:IsA("Animation") and o or o:FindFirstChildWhichIsA("Animation", true)
+            if a and a.AnimationId ~= "" then resolvedAnims[raw] = a.AnimationId end
+        end
+    end)
+end
+for _, d in ipairs(DANCES) do
+    if d.resolve then task.spawn(resolveAnimId, d.r15) end
+end
+
+local speedParams = RaycastParams.new()
+speedParams.FilterType = Enum.RaycastFilterType.Exclude
+
+RunService.Heartbeat:Connect(function(dt)
     local hum = getHum()
     if not hum then return end
     hookHumanoid(hum)
 
-    -- скорость
-    if runMult ~= 1 then
-        local target = gameSpeed * runMult
-        lastTarget = target
-        if hum.WalkSpeed ~= target then hum.WalkSpeed = target end
-    elseif lastTarget and math.abs(hum.WalkSpeed - lastTarget) < 0.01 then
-        hum.WalkSpeed = gameSpeed
-        lastTarget = nil
+    -- скорость: добавляем смещение в сторону движения.
+    -- Так работает, даже если игра сама постоянно сбрасывает WalkSpeed.
+    if runMult > 1 then
+        local char = getChar()
+        local root = char and char:FindFirstChild("HumanoidRootPart")
+        local dir = hum.MoveDirection
+        if root and dir.Magnitude > 0.05 then
+            local step = dir.Unit * (hum.WalkSpeed * (runMult - 1) * dt)
+            if step.Magnitude > 0 then
+                speedParams.FilterDescendantsInstances = {char}
+                local hit = workspace:Raycast(root.Position, step.Unit * (step.Magnitude + 2), speedParams)
+                if noclipOn or not hit then
+                    root.CFrame = root.CFrame + step
+                end
+            end
+        end
     end
 
     -- танец (постоянно, реплицируется на других игроков через Animator)
@@ -432,7 +464,8 @@ RunService.Heartbeat:Connect(function()
             if animator then
                 local anim = Instance.new("Animation")
                 local isR6 = hum.RigType == Enum.HumanoidRigType.R6
-                anim.AnimationId = isR6 and DANCES[danceIndex].r6 or DANCES[danceIndex].r15
+                local raw = isR6 and DANCES[danceIndex].r6 or DANCES[danceIndex].r15
+                anim.AnimationId = resolvedAnims[raw] or raw
                 danceTrack = animator:LoadAnimation(anim)
                 danceTrack.Looped = true
                 danceTrack.Priority = Enum.AnimationPriority.Action4
@@ -599,6 +632,7 @@ local tracked = {}
 local objectsScanned = false
 local strictFilter = true
 local skipped = {}
+local rejected = {}  -- отсеянные фильтром объекты: перепроверяем позже, вдруг у них догрузились части
 
 local function classify(inst)
     if not (inst:IsA("Model") or inst:IsA("BasePart")) then return nil end
@@ -665,10 +699,14 @@ local function considerObject(inst)
     -- фильтр декораций
     if strictFilter then
         if inDecorFolder(inst) or not hasInteractive(inst) then
-            skipped[kind] = (skipped[kind] or 0) + 1
+            if not rejected[inst] then
+                skipped[kind] = (skipped[kind] or 0) + 1
+            end
+            rejected[inst] = true
             return
         end
     end
+    rejected[inst] = nil
 
     local part = getMainPart(inst)
     if not part then return end
@@ -741,9 +779,33 @@ local function updateObjects()
             e.label.Enabled = false
         end
     end
-    table.sort(list, function(a, b) return a.d < b.d end)
-    for i, item in ipairs(list) do
-        item.e.hl.Enabled = i <= budget
+    -- лимит подсветок делим между типами поровну (по кругу, от ближних к дальним),
+    -- чтобы окна не вытеснялись генераторами и паллетами
+    local byKind = {}
+    for _, item in ipairs(list) do
+        local k = item.e.kind
+        byKind[k] = byKind[k] or {}
+        table.insert(byKind[k], item)
+        item.e.hl.Enabled = false
+    end
+    local queues = {}
+    for _, q in pairs(byKind) do
+        table.sort(q, function(a, b) return a.d < b.d end)
+        queues[#queues + 1] = q
+    end
+    local used, idx = 0, 1
+    while used < budget do
+        local progressed = false
+        for _, q in ipairs(queues) do
+            local item = q[idx]
+            if item and used < budget then
+                item.e.hl.Enabled = true
+                used += 1
+                progressed = true
+            end
+        end
+        if not progressed then break end
+        idx += 1
     end
 end
 
@@ -761,8 +823,21 @@ espSetStrict = function(on)
 end
 
 task.spawn(function()
+    local tick = 0
     while screen.Parent do
-        if objectsScanned then pcall(updateObjects) end
+        if objectsScanned then
+            pcall(updateObjects)
+            tick += 1
+            if tick % 6 == 0 then -- раз в ~3 секунды перепроверяем отсеянные объекты
+                for inst in pairs(rejected) do
+                    if inst.Parent then
+                        pcall(considerObject, inst)
+                    else
+                        rejected[inst] = nil
+                    end
+                end
+            end
+        end
         task.wait(0.5)
     end
 end)
