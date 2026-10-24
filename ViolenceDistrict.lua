@@ -8,17 +8,14 @@
 -- ================== НАСТРОЙКИ ==================
 local RUN_MAX = 4              -- максимум множителя скорости (x)
 local DANCES = {               -- стандартные танцы Roblox, тип рига определяется автоматически
-    -- Rambunctious: эмоция из каталога (ID предмета 108128682361404). Она рассчитана на R15;
-    -- на R6 вместо неё играет обычный R6-танец. Если анимация не грузится, подставь её ID в r15.
-    {name = "Rambunctious", r6 = "rbxassetid://182435998", r15 = "rbxassetid://108128682361404", resolve = true},
+    -- Rambunctious: на R15 играет настоящая эмоция из каталога (ID предмета 108128682361404),
+    -- на R6 (настоящая эмоция там не работает) строится своя роботизированная анимация.
+    -- Если анимация на R6 не создалась, играет Dance 1 (r6).
+    {name = "Rambunctious", r6 = "rbxassetid://182435998", r15 = "rbxassetid://108128682361404", resolve = true, custom = true},
     {name = "Dance 1", r6 = "rbxassetid://182435998", r15 = "rbxassetid://507771019"},
     {name = "Dance 2", r6 = "rbxassetid://182436842", r15 = "rbxassetid://507776043"},
     {name = "Dance 3", r6 = "rbxassetid://182436935", r15 = "rbxassetid://507777268"},
-    -- "токсичные" танцы. Там, где для R6 нет отдельной анимации, подставляется обычный R6-танец.
     {name = "Смех (издёвка)", r6 = "rbxassetid://129423131", r15 = "rbxassetid://507770818"},
-    {name = "Floss",          r6 = "rbxassetid://182436842", r15 = "rbxassetid://5917459365"},
-    {name = "Hype",           r6 = "rbxassetid://182436935", r15 = "rbxassetid://3695333486"},
-    {name = "Dorky",          r6 = "rbxassetid://182435998", r15 = "rbxassetid://4212455378"},
 }
 
 local HIGHLIGHT_LIMIT = 30     -- Roblox рисует не больше ~31 подсветки одновременно
@@ -431,6 +428,60 @@ for _, d in ipairs(DANCES) do
     if d.resolve then task.spawn(resolveAnimId, d.r15) end
 end
 
+-- Своя R6-версия Rambunctious (роботизированный танец): настоящая эмоция работает только на R15.
+-- Анимация строится из ключевых кадров и играется локально; другие игроки видят её как обычную.
+local customDanceId
+local function getCustomDance()
+    if customDanceId ~= nil then return customDanceId or nil end
+    customDanceId = false
+    local okc, id = pcall(function()
+        local ks = Instance.new("KeyframeSequence")
+        ks.Loop = true
+        ks.Priority = Enum.AnimationPriority.Action4
+
+        local function P(name, cf)
+            local p = Instance.new("Pose")
+            p.Name = name
+            p.CFrame = cf
+            p.Weight = 1
+            return p
+        end
+        local function A(x, y, z) return CFrame.Angles(math.rad(x), math.rad(y), math.rad(z)) end
+
+        -- tw: поворот корпуса, lean: наклон, hy/hn: поворот и кивок головой,
+        -- rA/lA: взмах рук, rL/lL: шаг ногами
+        local function frame(t, tw, lean, hy, hn, rA, lA, rL, lL)
+            local kf = Instance.new("Keyframe")
+            kf.Time = t
+            local root = P("HumanoidRootPart", CFrame.new())
+            root.Weight = 0
+            local torso = P("Torso", A(-lean, 0, tw))
+            P("Head", A(hn, 0, hy)).Parent = torso
+            P("Left Arm", A(0, 0, -lA)).Parent = torso
+            P("Right Arm", A(0, 0, rA)).Parent = torso
+            P("Left Leg", A(0, 0, -lL)).Parent = torso
+            P("Right Leg", A(0, 0, rL)).Parent = torso
+            torso.Parent = root
+            kf:AddPose(root)
+            kf.Parent = ks
+        end
+
+        frame(0.00,  20, 10,  35, 15,  120, -30,  0, 25)
+        frame(0.25, -20, 10, -35, 15,  -30, 120, 25,  0)
+        frame(0.50,  20, 10,  35, 15,  120, -30,  0, 25)
+        frame(0.75, -20, 10, -35, 15,  -30, 120, 25,  0)
+        frame(1.00,  20, 10,  35, 15,  120, -30,  0, 25)
+
+        return game:GetService("KeyframeSequenceProvider"):RegisterKeyframeSequence(ks)
+    end)
+    if okc and id then
+        customDanceId = (type(id) == "string") and id or tostring(id)
+    else
+        warn("[District GUI] не удалось создать R6-анимацию Rambunctious, играет Dance 1")
+    end
+    return customDanceId or nil
+end
+
 local speedParams = RaycastParams.new()
 speedParams.FilterType = Enum.RaycastFilterType.Exclude
 
@@ -445,7 +496,9 @@ RunService.Heartbeat:Connect(function(dt)
         local char = getChar()
         local root = char and char:FindFirstChild("HumanoidRootPart")
         local dir = hum.MoveDirection
-        if root and dir.Magnitude > 0.05 then
+        -- не вмешиваемся, пока игра держит персонажа на месте (генератор, лечение, оглушение и т.п.)
+        if root and dir.Magnitude > 0.05 and hum.WalkSpeed > 0 and not root.Anchored
+            and not hum.PlatformStand and not hum.Sit then
             local step = dir.Unit * (hum.WalkSpeed * (runMult - 1) * dt)
             if step.Magnitude > 0 then
                 speedParams.FilterDescendantsInstances = {char}
@@ -464,7 +517,9 @@ RunService.Heartbeat:Connect(function(dt)
             if animator then
                 local anim = Instance.new("Animation")
                 local isR6 = hum.RigType == Enum.HumanoidRigType.R6
-                local raw = isR6 and DANCES[danceIndex].r6 or DANCES[danceIndex].r15
+                local d = DANCES[danceIndex]
+                local raw = isR6 and d.r6 or d.r15
+                if isR6 and d.custom then raw = getCustomDance() or d.r6 end
                 anim.AnimationId = resolvedAnims[raw] or raw
                 danceTrack = animator:LoadAnimation(anim)
                 danceTrack.Looped = true
@@ -678,6 +733,7 @@ local function removeObject(inst)
     if e then
         e.hl:Destroy()
         e.label:Destroy()
+        for _, b in ipairs(e.boxes) do b:Destroy() end
         tracked[inst] = nil
     end
 end
@@ -724,7 +780,32 @@ local function considerObject(inst)
 
     local label = makeLabel(part, OBJECT_NAMES[kind], color)
 
-    tracked[inst] = {kind = kind, hl = hl, label = label, part = part}
+    -- запасная отрисовка: коробка на каждую часть модели. Нужна, если Highlight не виден
+    -- (лимит подсветок или невидимая модель-хитбокс)
+    local parts = inst:IsA("BasePart") and {inst} or {}
+    if inst:IsA("Model") then
+        for _, d in ipairs(inst:GetDescendants()) do
+            if d:IsA("BasePart") then parts[#parts + 1] = d end
+        end
+    end
+    local visible, boxes = false, {}
+    for i, bp in ipairs(parts) do
+        if bp.Transparency < 0.95 then visible = true end
+        if i <= 40 then
+            local b = Instance.new("BoxHandleAdornment")
+            b.Adornee = bp
+            b.Size = bp.Size
+            b.AlwaysOnTop = true
+            b.ZIndex = 5
+            b.Transparency = 0.6
+            b.Color3 = color
+            b.Visible = false
+            b.Parent = espFolder
+            boxes[#boxes + 1] = b
+        end
+    end
+
+    tracked[inst] = {kind = kind, hl = hl, label = label, part = part, boxes = boxes, visible = visible}
     inst.AncestryChanged:Connect(function(_, parent)
         if not parent then removeObject(inst) end
     end)
@@ -806,6 +887,12 @@ local function updateObjects()
         end
         if not progressed then break end
         idx += 1
+    end
+
+    -- коробки показываем там, где контур не нарисуется (не хватило лимита или модель невидима)
+    for _, e in pairs(tracked) do
+        local want = esp[e.kind] and not (e.hl.Enabled and e.visible)
+        for _, b in ipairs(e.boxes) do b.Visible = want end
     end
 end
 
