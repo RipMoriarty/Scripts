@@ -472,12 +472,28 @@ local function getCustomDance()
         frame(0.75, -20, 10, -35, 15,  -30, 120, 25,  0)
         frame(1.00,  20, 10,  35, 15,  120, -30,  0, 25)
 
-        return game:GetService("KeyframeSequenceProvider"):RegisterKeyframeSequence(ks)
+        -- в новых версиях Roblox KeyframeSequenceProvider устарел, поэтому сначала пробуем AnimationClipProvider
+        local okA, rA = pcall(function()
+            return game:GetService("AnimationClipProvider"):RegisterAnimationClip(ks)
+        end)
+        if okA and rA then return rA end
+        local okB, rB = pcall(function()
+            return game:GetService("KeyframeSequenceProvider"):RegisterKeyframeSequence(ks)
+        end)
+        if okB and rB then return rB end
+        error("AnimationClipProvider: " .. tostring(rA) .. " | KeyframeSequenceProvider: " .. tostring(rB))
     end)
     if okc and id then
         customDanceId = (type(id) == "string") and id or tostring(id)
     else
-        warn("[District GUI] не удалось создать R6-анимацию Rambunctious, играет Dance 1")
+        warn("[District GUI] не удалось создать R6-анимацию Rambunctious, играет Dance 1. Причина:", id)
+        pcall(function()
+            game:GetService("StarterGui"):SetCore("SendNotification", {
+                Title = "District GUI",
+                Text = "R6-анимация Rambunctious не создалась, играет Dance 1 (подробности в F9)",
+                Duration = 6,
+            })
+        end)
     end
     return customDanceId or nil
 end
@@ -738,6 +754,38 @@ local function removeObject(inst)
     end
 end
 
+-- Выбираем, какую модель обводить. "Окно" в игре может быть невидимым хитбоксом внутри видимой модели,
+-- тогда обводим родительскую модель. Если видимой модели нет совсем, вернёт nil (рисуем запасные коробки).
+local function hasVisibleParts(inst)
+    if inst:IsA("BasePart") then return inst.Transparency < 0.95 end
+    for _, d in ipairs(inst:GetDescendants()) do
+        if d:IsA("BasePart") and d.Transparency < 0.95 then return true end
+    end
+    return false
+end
+
+local function countParts(inst)
+    local n = 0
+    for _, d in ipairs(inst:GetDescendants()) do
+        if d:IsA("BasePart") then n += 1 end
+    end
+    return n
+end
+
+local function pickModel(inst)
+    local cur = inst
+    for _ = 1, 3 do
+        if hasVisibleParts(cur) then return cur end
+        local p = cur.Parent
+        if p and p:IsA("Model") and not Players:GetPlayerFromCharacter(p) and countParts(p) <= 80 then
+            cur = p
+        else
+            break
+        end
+    end
+    return nil
+end
+
 local OBJECT_NAMES = {Generators = "Генератор", Pallets = "Паллета", Windows = "Окно"}
 
 local function considerObject(inst)
@@ -768,8 +816,9 @@ local function considerObject(inst)
     if not part then return end
 
     local color = ESP_COLORS[kind]
+    local target = pickModel(inst)
     local hl = Instance.new("Highlight")
-    hl.Adornee = inst                      -- обводим саму модель, а не коробку
+    hl.Adornee = target or inst                      -- обводим саму модель, а не коробку
     hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
     hl.FillTransparency = 0.7
     hl.OutlineTransparency = 0
@@ -788,10 +837,9 @@ local function considerObject(inst)
             if d:IsA("BasePart") then parts[#parts + 1] = d end
         end
     end
-    local visible, boxes = false, {}
+    local visible, boxes = target ~= nil, {}
     for i, bp in ipairs(parts) do
-        if bp.Transparency < 0.95 then visible = true end
-        if i <= 40 then
+        if i <= 40 and not visible then
             local b = Instance.new("BoxHandleAdornment")
             b.Adornee = bp
             b.Size = bp.Size
@@ -889,9 +937,9 @@ local function updateObjects()
         idx += 1
     end
 
-    -- коробки показываем там, где контур не нарисуется (не хватило лимита или модель невидима)
+    -- коробки показываем только для невидимых объектов (хитбоксов): у видимых обводится сама модель
     for _, e in pairs(tracked) do
-        local want = esp[e.kind] and not (e.hl.Enabled and e.visible)
+        local want = esp[e.kind] and not e.visible
         for _, b in ipairs(e.boxes) do b.Visible = want end
     end
 end
