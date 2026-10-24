@@ -67,7 +67,7 @@ local TYPE_ORDER = { "ENEMIES", "CURSES", "UPGRADES" }
 local running = true
 local conns = {}
 local state = { action = "idle" }
-local diag = { total = 0, withCollect = 0, visits = 0, collected = 0, failed = 0, unsafe = 0, noRoute = 0, countAt = 0, log = {} }
+local diag = { total = 0, visible = 0, withCollect = 0, visits = 0, collected = 0, failed = 0, unsafe = 0, noRoute = 0, countAt = 0, log = {} }
 
 local function logEvent(text)
     local log = diag.log
@@ -159,6 +159,7 @@ local spawnPart = nil
 local inRound = FALLBACK_ROUND
 local counters = EMPTY
 local missing = {}
+local giftContainers, mineContainers = {}, {}
 
 local function refreshObjects()
     local m = {}
@@ -173,10 +174,26 @@ local function refreshObjects()
         return parent:FindFirstChild(name) or EMPTY
     end
     items = get(workspace, "Item_Pools", "Item_Pools") or EMPTY
-    gifts = get(items, "Gift", "Item_Pools.Gift") or EMPTY
-    goldengifts = get(items, "GoldenGift", "Item_Pools.GoldenGift") or EMPTY
-    tripmines = get(items, "Tripmine", "Item_Pools.Tripmine") or EMPTY
+    gifts = opt(items, "Gift")
+    goldengifts = opt(items, "GoldenGift")
+    tripmines = opt(items, "Tripmine")
     goldtrip = opt(items, "GoldTripmines")
+
+    -- the game keeps gifts / mines in pools (Gift_Model, ...): find every container by its name
+    local gc, mc = {}, {}
+    if items ~= EMPTY then
+        for _, c in ipairs(items:GetChildren()) do
+            local n = c.Name:lower()
+            if not n:find("highlight", 1, true) and not n:find("collect", 1, true) and not n:find("showlocation", 1, true) then
+                if n:find("gift", 1, true) then
+                    gc[#gc + 1] = { inst = c, golden = (n:find("golden", 1, true) or n:find("passage", 1, true)) ~= nil }
+                end
+                if n:find("tripmine", 1, true) then mc[#mc + 1] = c end
+            end
+        end
+    end
+    giftContainers, mineContainers = gc, mc
+    if #gc == 0 then m[#m + 1] = "gift containers in Item_Pools" end
     bullets = opt(items, "Bullet")
     enemies = get(workspace, "Enemies", "Enemies") or EMPTY
     skinwalkers = opt(workspace, "Skinwalkers")
@@ -254,6 +271,13 @@ local function resetMagnet(full)
     end)
 end
 
+-- a gift / mine may be a part or a model: return the part that carries position / transparency
+local function partOf(c)
+    if c:IsA("BasePart") then return c end
+    if c:IsA("Model") then return c.PrimaryPart or c:FindFirstChildWhichIsA("BasePart", true) end
+    return nil
+end
+
 ------------------------------------------------------------------ obstacles (mines) tracking
 local obstacles = {}
 local obsState = setmetatable({}, { __mode = "k" })
@@ -261,6 +285,27 @@ local obsAt = 0
 local pRad = 3
 local movingCount = 0
 local routeBudget = 0
+
+local mineCache, mineCacheAt = {}, 0
+local function rebuildMineCache()
+    if tick() - mineCacheAt < 0.5 then return end
+    mineCacheAt = tick()
+    local list, buckets = {}, {}
+    for _, src in ipairs(mineContainers) do
+        for _, m in ipairs(src:GetChildren()) do
+            local part = partOf(m)
+            if part then
+                local p = part.Position
+                local key = math.floor(p.X / 3) .. "," .. math.floor(p.Y / 3) .. "," .. math.floor(p.Z / 3)
+                buckets[key] = (buckets[key] or 0) + 1
+                list[#list + 1] = { part = part, key = key }
+            end
+        end
+    end
+    -- many parts at one spot = parked pool objects, not real mines
+    for _, e in ipairs(list) do e.parked = buckets[e.key] > 4 end
+    mineCache = list
+end
 
 local function trackPart(part, dt, origin, list)
     local pos = part.Position
@@ -310,8 +355,10 @@ local function updateObstacles(force)
         end
     end
 
-    addFolder(tripmines, true)
-    addFolder(goldtrip, true)
+    rebuildMineCache()
+    for _, e in ipairs(mineCache) do
+        if not e.parked and e.part.Parent and e.part.Transparency ~= 1 then trackPart(e.part, dt, origin, list) end
+    end
     if CFG.avoidEnemies and not CFG.god then
         addFolder(enemies, false)
         addFolder(skinwalkers, false)
@@ -421,13 +468,14 @@ local blacklist = setmetatable({}, { __mode = "k" })
 
 -- Fallback discovery: any part that has a child named "Collect" anywhere in Workspace is a gift.
 -- Used when the Item_Pools folders are empty (level not generated / streamed yet / different folder).
-local foundGifts, foundWhere = {}, {}
+local foundGifts, foundWhere, nameStats = {}, {}, {}
 local lastScan, lastExplore, scanning = 0, 0, false
 
-local function scanWorkspaceForGifts()
+local function scanWorkspaceForGifts(wantStats)
     if scanning then return end
     scanning = true
     local list, where = {}, {}
+    local stats = wantStats and {} or nil
     local ok, desc = pcall(function() return workspace:GetDescendants() end)
     if ok then
         for i, d in ipairs(desc) do
@@ -439,9 +487,17 @@ local function scanWorkspaceForGifts()
                     where[key] = (where[key] or 0) + 1
                 end
             end
+            if stats then
+                local ln = d.Name:lower()
+                if ln:find("gift", 1, true) or ln:find("mine", 1, true) or ln:find("collect", 1, true) then
+                    local key = d.ClassName .. " " .. d.Name .. " in " .. (d.Parent and d.Parent.Name or "?")
+                    stats[key] = (stats[key] or 0) + 1
+                end
+            end
             if i % 4000 == 0 then task.wait() end
         end
     end
+    if stats then nameStats = stats end
     foundGifts, foundWhere, lastScan = list, where, tick()
     scanning = false
 end
@@ -467,41 +523,84 @@ local function exploreStream()
     end
 end
 
+local giftCache, giftSet, giftCacheAt = {}, setmetatable({}, { __mode = "k" }), 0
+
+local function rebuildGiftCache(force)
+    if not force and tick() - giftCacheAt < 0.5 then return end
+    giftCacheAt = tick()
+    local list, buckets = {}, {}
+    local set = setmetatable({}, { __mode = "k" })
+    for _, src in ipairs(giftContainers) do
+        for _, c in ipairs(src.inst:GetChildren()) do
+            local part = partOf(c)
+            if part then
+                local p = part.Position
+                local key = math.floor(p.X / 3) .. "," .. math.floor(p.Y / 3) .. "," .. math.floor(p.Z / 3)
+                buckets[key] = (buckets[key] or 0) + 1
+                list[#list + 1] = { part = part, obj = c, golden = src.golden, key = key }
+                set[part] = true
+            end
+        end
+    end
+    -- many parts at one spot = parked pool objects, not real gifts
+    for _, e in ipairs(list) do e.parked = buckets[e.key] > 4 end
+    giftCache, giftSet = list, set
+end
+
+local function hasCollect(e)
+    if e.part:FindFirstChild("Collect", true) then return true end
+    return e.obj ~= e.part and e.obj:FindFirstChild("Collect", true) ~= nil
+end
+
 local function pickCandidates(root, useNormal, useGolden, limit)
+    rebuildGiftCache()
     local rp = root.Position
-    local best = {}
-    local function consider(g, d)
-        local n = #best
-        if n >= limit and d >= best[n].d then return end
+    local kv = workspace:FindFirstChild("KillVoid")
+    local minY = kv and (kv.Position.Y + 30) or -1e9
+    local now = tick()
+    local cap = limit * 3
+    local near = {}
+    local function consider(e, d)
+        local n = #near
+        if n >= cap and d >= near[n].d then return end
         local pos = n + 1
         for i = 1, n do
-            if d < best[i].d then pos = i break end
+            if d < near[i].d then pos = i break end
         end
-        table.insert(best, pos, { g = g, d = d })
-        if #best > limit then table.remove(best) end
+        table.insert(near, pos, { e = e, d = d })
+        if #near > cap then table.remove(near) end
     end
-    local function scan(folder)
-        for _, g in ipairs(folder:GetChildren()) do
-            if g:IsA("BasePart") and g.Transparency ~= 1 and not (blacklist[g] and blacklist[g] > tick()) then
-                local d = (g.Position - rp).Magnitude
-                if (#best < limit or d < best[#best].d) and g:FindFirstChild("Collect", true) then
-                    consider(g, d)
-                end
+    for _, e in ipairs(giftCache) do
+        local g = e.part
+        if not e.parked and g.Parent and g.Transparency ~= 1
+            and ((e.golden and useGolden) or (not e.golden and useNormal))
+            and not (blacklist[g] and blacklist[g] > now) then
+            local pos = g.Position
+            if pos.Y > minY then
+                local d = (pos - rp).Magnitude
+                if #near < cap or d < near[#near].d then consider(e, d) end
             end
         end
     end
-    if useNormal then scan(gifts) end
-    if useGolden then scan(goldengifts) end
+    -- gifts found by the workspace scan that are not inside a known container
     for _, g in ipairs(foundGifts) do
-        if g.Parent and g.Parent ~= gifts and g.Parent ~= goldengifts and g.Transparency ~= 1
-            and not (blacklist[g] and blacklist[g] > tick()) then
-            local nm = (g.Name .. " " .. g.Parent.Name):lower()
-            local golden = nm:find("golden", 1, true) ~= nil
+        if g.Parent and not giftSet[g] and g.Transparency ~= 1 and not (blacklist[g] and blacklist[g] > now) then
+            local golden = (g.Name .. " " .. g.Parent.Name):lower():find("golden", 1, true) ~= nil
             if (golden and useGolden) or (not golden and useNormal) then
                 local d = (g.Position - rp).Magnitude
-                if (#best < limit or d < best[#best].d) and g:FindFirstChild("Collect") then consider(g, d) end
+                if #near < cap or d < near[#near].d then consider({ part = g, obj = g, golden = golden }, d) end
             end
         end
+    end
+    -- gifts that are already collectable (have a Collect child) first, then the nearest visible ones:
+    -- the game may attach Collect only when the player is close
+    local best = {}
+    for _, n in ipairs(near) do
+        if #best < limit and hasCollect(n.e) then best[#best + 1] = { g = n.e.part, d = n.d, ready = true } end
+    end
+    for _, n in ipairs(near) do
+        if #best >= limit then break end
+        if not hasCollect(n.e) then best[#best + 1] = { g = n.e.part, d = n.d, ready = false } end
     end
     return best
 end
@@ -560,8 +659,10 @@ local function followRoute(route, g)
 end
 
 -- returns true if it did something (so the caller moves on), false if the gift was rejected
-local function stillThere(g)
-    return g.Parent ~= nil and g.Transparency ~= 1 and g:FindFirstChild("Collect", true) ~= nil
+local function stillThere(g, hadCollect)
+    if g.Parent == nil or g.Transparency == 1 then return false end
+    if hadCollect and g:FindFirstChild("Collect", true) == nil then return false end
+    return true
 end
 
 local function visit(g)
@@ -594,16 +695,17 @@ local function visit(g)
         local res = followRoute(route, g)
         if res == "abort" then return true end
         if res == "done" then
+            local hadCollect = g:FindFirstChild("Collect", true) ~= nil
             local t0 = tick()
-            while stillThere(g) and tick() - t0 < 0.6 do task.wait(0.03) end
-            if stillThere(g) then
+            while stillThere(g, hadCollect) and tick() - t0 < 0.6 do task.wait(0.03) end
+            if stillThere(g, hadCollect) then
                 -- touch did not register: put root + hitbox exactly on the gift once more
                 local _, r2, h2 = charParts()
                 if r2 then snap(r2, h2, g.Position) end
                 t0 = tick()
-                while stillThere(g) and tick() - t0 < 0.5 do task.wait(0.03) end
+                while stillThere(g, hadCollect) and tick() - t0 < 0.5 do task.wait(0.03) end
             end
-            if stillThere(g) then
+            if stillThere(g, hadCollect) then
                 blacklist[g] = tick() + 8
                 diag.failed += 1
                 logEvent("reached gift but it was NOT collected")
@@ -620,14 +722,15 @@ end
 
 ------------------------------------------------------------------ diagnostics
 local function countGifts()
-    local total, withC = 0, 0
-    for _, f in ipairs({ gifts, goldengifts }) do
-        for _, g in ipairs(f:GetChildren()) do
-            total += 1
-            if g:IsA("BasePart") and g.Transparency ~= 1 and g:FindFirstChild("Collect", true) then withC += 1 end
+    rebuildGiftCache(true)
+    local vis, withC = 0, 0
+    for _, e in ipairs(giftCache) do
+        if not e.parked and e.part.Parent and e.part.Transparency ~= 1 then
+            vis += 1
+            if hasCollect(e) then withC += 1 end
         end
     end
-    diag.total, diag.withCollect = total, withC
+    diag.total, diag.visible, diag.withCollect = #giftCache, vis, withC
 end
 
 local function diagGifts()
@@ -643,7 +746,7 @@ local function diagGifts()
     else
         out[#out + 1] = "no character root"
     end
-    if tick() - lastScan > 3 then pcall(scanWorkspaceForGifts) end
+    pcall(scanWorkspaceForGifts, true)
     local kv = workspace:FindFirstChild("KillVoid")
     out[#out + 1] = string.format("streaming=%s | rooms=%d | KillVoid.Y=%s | Spawn=%s | voidGuard=%s | missing=[%s]",
         tostring(workspace.StreamingEnabled), #currentRooms:GetChildren(),
@@ -652,16 +755,75 @@ local function diagGifts()
         tostring(CFG.voidGuard), table.concat(missing, ", "))
     local pools = {}
     for _, c in ipairs(items:GetChildren()) do
-        if #pools >= 15 then pools[#pools + 1] = "..." break end
+        if #pools >= 80 then pools[#pools + 1] = "..." break end
         pools[#pools + 1] = c.Name .. "(" .. c.ClassName .. ":" .. #c:GetChildren() .. ")"
     end
     out[#out + 1] = "Item_Pools children: " .. table.concat(pools, ", ")
+    local gcn, mcn = {}, {}
+    for _, g in ipairs(giftContainers) do gcn[#gcn + 1] = g.inst.Name .. (g.golden and "[golden]" or "") end
+    for _, m2 in ipairs(mineContainers) do mcn[#mcn + 1] = m2.Name end
+    out[#out + 1] = "gift containers: [" .. table.concat(gcn, ", ") .. "] | mine containers: [" .. table.concat(mcn, ", ") .. "]"
     local fw = {}
     for k, v in pairs(foundWhere) do fw[#fw + 1] = k .. "=" .. v end
     out[#out + 1] = "workspace scan, parts with a 'Collect' child: " .. (#fw > 0 and table.concat(fw, ", ") or "none")
+    local ns = {}
+    for k, v in pairs(nameStats) do ns[#ns + 1] = { k = k, v = v } end
+    table.sort(ns, function(a2, b2) return a2.v > b2.v end)
+    local nsl = {}
+    for i = 1, math.min(25, #ns) do nsl[#nsl + 1] = ns[i].k .. " x" .. ns[i].v end
+    out[#out + 1] = "workspace names with gift/mine/collect: " .. (#nsl > 0 and table.concat(nsl, "; ") or "none")
+    local rsl, rseen = {}, {}
+    for _, d in ipairs(ReplicatedStorage:GetDescendants()) do
+        if #rsl >= 20 then break end
+        local ln = d.Name:lower()
+        if ln:find("gift", 1, true) or ln:find("mine", 1, true) then
+            local full = (d:GetFullName():gsub("^ReplicatedStorage%.", ""))
+            if not rseen[full] then
+                rseen[full] = true
+                rsl[#rsl + 1] = d.ClassName .. " " .. full
+            end
+        end
+    end
+    out[#out + 1] = "ReplicatedStorage gift/mine objects: " .. (#rsl > 0 and table.concat(rsl, "; ") or "none")
+    local cl = {}
+    for _, c in ipairs(counters:GetChildren()) do
+        local okv, val = pcall(function() return c.Value end)
+        local at = {}
+        for k, v in pairs(c:GetAttributes()) do at[#at + 1] = k .. "=" .. tostring(v) end
+        cl[#cl + 1] = c.Name .. "=" .. tostring(okv and val or "?") .. (#at > 0 and (" {" .. table.concat(at, ",") .. "}") or "")
+    end
+    out[#out + 1] = "GiftCounters: " .. table.concat(cl, " | ")
     countGifts()
-    out[#out + 1] = string.format("gifts in folder=%d collectable=%d | visits=%d collected=%d failed=%d unsafe=%d noRoute=%d",
-        diag.total, diag.withCollect, diag.visits, diag.collected, diag.failed, diag.unsafe, diag.noRoute)
+    local parked = 0
+    for _, e in ipairs(giftCache) do if e.parked then parked += 1 end end
+    out[#out + 1] = string.format("gift parts=%d visible=%d collectable(Collect)=%d parked-ignored=%d | visits=%d collected=%d failed=%d unsafe=%d noRoute=%d",
+        diag.total, diag.visible, diag.withCollect, parked, diag.visits, diag.collected, diag.failed, diag.unsafe, diag.noRoute)
+    local shown = 0
+    for pass = 1, 2 do
+        for _, e in ipairs(giftCache) do
+            if shown >= 3 then break end
+            local ok2 = (pass == 1 and not e.parked and e.part.Transparency ~= 1) or (pass == 2 and shown == 0)
+            if ok2 then
+                shown += 1
+                local kids = {}
+                for _, k in ipairs(e.obj:GetChildren()) do
+                    if #kids < 6 then kids[#kids + 1] = k.Name .. ":" .. k.ClassName end
+                end
+                local pp = e.part.Position
+                out[#out + 1] = string.format("sample gift %d: %s (%s) in %s pos=(%.0f,%.0f,%.0f) transp=%.2f anchored=%s cantouch=%s golden=%s parked=%s children=[%s]",
+                    shown, e.obj.Name, e.part.ClassName, e.obj.Parent and e.obj.Parent.Name or "?", pp.X, pp.Y, pp.Z,
+                    e.part.Transparency, tostring(e.part.Anchored), tostring(e.part.CanTouch), tostring(e.golden), tostring(e.parked),
+                    table.concat(kids, ","))
+            end
+        end
+        if shown > 0 then break end
+    end
+    rebuildMineCache()
+    local mv, mp = 0, 0
+    for _, e in ipairs(mineCache) do
+        if e.parked then mp += 1 elseif e.part.Transparency ~= 1 then mv += 1 end
+    end
+    out[#out + 1] = string.format("mine parts=%d visible=%d parked-ignored=%d", #mineCache, mv, mp)
     for i, o in ipairs(obstacles) do
         if i > 12 then break end
         local part = o.part
@@ -680,8 +842,8 @@ local function diagGifts()
                 routeBudget = 4000
                 route = findRoute(root.Position, g.Position, obs, 4)
             end
-            out[#out + 1] = string.format("gift %d: %s dist=%.0f safe=%s route=%s",
-                i, g.Name, c.d, tostring(safe), route and (#route .. " pts") or "none")
+            out[#out + 1] = string.format("gift %d: %s dist=%.0f ready=%s safe=%s route=%s",
+                i, g.Name, c.d, tostring(c.ready), tostring(safe), route and (#route .. " pts") or "none")
         end
         if #cands == 0 then out[#out + 1] = "no candidate gifts (filtered, blacklisted or folder empty)" end
     end
@@ -1518,8 +1680,8 @@ task.spawn(function()
             diag.countAt = tick()
             pcall(countGifts)
         end
-        stGifts.Text = string.format("Gifts in folder: %d (collectable %d, found by scan %d) | collected: %d | failed: %d | skipped: mine zone %d, no route %d | level rooms: %d",
-            diag.total, diag.withCollect, #foundGifts, diag.collected, diag.failed, diag.unsafe, diag.noRoute, #currentRooms:GetChildren())
+        stGifts.Text = string.format("Gift parts: %d (visible %d, collectable %d, found by scan %d) | collected: %d | failed: %d | skipped: mine zone %d, no route %d | rooms: %d",
+            diag.total, diag.visible, diag.withCollect, #foundGifts, diag.collected, diag.failed, diag.unsafe, diag.noRoute, #currentRooms:GetChildren())
         stLog.Text = table.concat(diag.log, "\n")
         task.wait(0.4)
     end
@@ -1607,7 +1769,7 @@ task.spawn(function()
             if #cands == 0 then
                 state.action = "no gifts"
                 local rooms = #currentRooms:GetChildren()
-                logEvent(string.format("no gifts known (rooms loaded: %d, streaming: %s)", rooms, tostring(workspace.StreamingEnabled)))
+                logEvent(string.format("no visible gifts (containers: %d, parts: %d, rooms: %d)", #giftContainers, #giftCache, rooms))
                 if rooms > 0 or tick() - roundStart > 20 then
                     if tick() - lastScan > 4 and not scanning then task.spawn(scanWorkspaceForGifts) end
                     if tick() - lastExplore > 12 then
