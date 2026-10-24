@@ -11,7 +11,17 @@ local DANCES = {               -- стандартные танцы Roblox, ти
     {name = "Dance 1", r6 = "rbxassetid://182435998", r15 = "rbxassetid://507771019"},
     {name = "Dance 2", r6 = "rbxassetid://182436842", r15 = "rbxassetid://507776043"},
     {name = "Dance 3", r6 = "rbxassetid://182436935", r15 = "rbxassetid://507777268"},
+    -- "токсичные" танцы. Там, где для R6 нет отдельной анимации, подставляется обычный R6-танец.
+    {name = "Смех (издёвка)", r6 = "rbxassetid://129423131", r15 = "rbxassetid://507770818"},
+    {name = "Floss",          r6 = "rbxassetid://182436842", r15 = "rbxassetid://5917459365"},
+    {name = "Hype",           r6 = "rbxassetid://182436935", r15 = "rbxassetid://3695333486"},
+    {name = "Dorky",          r6 = "rbxassetid://182435998", r15 = "rbxassetid://4212455378"},
 }
+
+local HIGHLIGHT_LIMIT = 30     -- Roblox рисует не больше ~31 подсветки одновременно
+
+-- Строгий фильтр ESP пропускает объекты, у которых в названии папок-предков есть эти слова
+local EXCLUDE_ANCESTOR_WORDS = {"decor", "deco", "prop", "fake", "background", "static", "scenery", "ambient"}
 
 -- Как ESP ищет объекты на карте (по части имени, без учёта регистра).
 -- Если что-то не подсвечивается, поменяй слова под реальные названия в игре.
@@ -63,7 +73,7 @@ if not ok2 then espFolder.Parent = workspace end
 
 -- ================== СОСТОЯНИЕ ==================
 local runMult = 1
-local noclipOn, danceOn = false, false
+local noclipOn, danceOn, moonOn = false, false, false
 local danceIndex = 1
 local danceTrack
 local gameSpeed, lastTarget = 16, nil
@@ -129,8 +139,8 @@ local TEXT   = Color3.fromRGB(235, 235, 240)
 
 local main = Instance.new("Frame")
 main.Name = "Main"
-main.Size = UDim2.fromOffset(270, 280)
-main.Position = UDim2.new(0.5, -135, 0.5, -140)
+main.Size = UDim2.fromOffset(270, 312)
+main.Position = UDim2.new(0.5, -135, 0.5, -156)
 main.BackgroundColor3 = BG
 main.BorderSizePixel = 0
 main.Active = true
@@ -346,6 +356,14 @@ end)
 
 makeToggle(mainPage, 140, "Noclip", false, function(on) noclipOn = on end)
 
+makeToggle(mainPage, 180, "Авто мунвок", false, function(on)
+    moonOn = on
+    if not on then
+        local hum = getHum()
+        if hum then hum.AutoRotate = true end
+    end
+end)
+
 -- ---------- вкладка ESP (кнопки привязываются ниже) ----------
 local espRefreshObjects -- объявлена заранее, определяется в блоке ESP
 
@@ -363,6 +381,11 @@ for idx, item in ipairs(espLabels) do
         if espRefreshObjects then espRefreshObjects() end
     end)
 end
+
+local espSetStrict -- определяется в блоке ESP ниже
+makeToggle(espPage, 4 + #espLabels * 38, "Строгий фильтр", true, function(on)
+    if espSetStrict then espSetStrict(on) end
+end)
 
 showPage("Main")
 
@@ -424,6 +447,26 @@ end)
 LP.CharacterAdded:Connect(function()
     danceTrack = nil
     hookedHum = nil
+end)
+
+-- Авто мунвок: при движении персонаж смотрит в сторону, противоположную движению,
+-- поэтому со стороны выглядит так, будто он скользит назад (разворот видят все игроки)
+RunService.Heartbeat:Connect(function()
+    if not moonOn then return end
+    local char = getChar()
+    local hum = getHum()
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    if not (hum and root) then return end
+
+    local dir = hum.MoveDirection
+    dir = Vector3.new(dir.X, 0, dir.Z)
+    if dir.Magnitude > 0.05 then
+        hum.AutoRotate = false
+        local pos = root.Position
+        root.CFrame = CFrame.lookAt(pos, pos - dir.Unit)
+    else
+        hum.AutoRotate = false -- на месте сохраняем текущий разворот
+    end
 end)
 
 -- Noclip
@@ -554,6 +597,8 @@ Players.PlayerRemoving:Connect(removePlayerEsp)
 -- ----- объекты карты (генераторы / паллеты / окна) -----
 local tracked = {}
 local objectsScanned = false
+local strictFilter = true
+local skipped = {}
 
 local function classify(inst)
     if not (inst:IsA("Model") or inst:IsA("BasePart")) then return nil end
@@ -565,17 +610,48 @@ local function classify(inst)
     end
 end
 
+-- Настоящий игровой объект отличается от декорации наличием "живых" частей:
+-- промпт взаимодействия, скрипт, значения/атрибуты, теги, аниматор
+local function hasInteractive(inst)
+    if #inst:GetTags() > 0 then return true end
+    if next(inst:GetAttributes()) ~= nil then return true end
+    for _, d in ipairs(inst:GetDescendants()) do
+        if d:IsA("ProximityPrompt") or d:IsA("ClickDetector") or d:IsA("LuaSourceContainer")
+            or d:IsA("ValueBase") or d:IsA("Animator") or d:IsA("AnimationController") then
+            return true
+        end
+        if #d:GetTags() > 0 or next(d:GetAttributes()) ~= nil then
+            return true
+        end
+    end
+    return false
+end
+
+local function inDecorFolder(inst)
+    local p = inst.Parent
+    while p and p ~= workspace do
+        local n = p.Name:lower()
+        for _, w in ipairs(EXCLUDE_ANCESTOR_WORDS) do
+            if n:find(w, 1, true) then return true end
+        end
+        p = p.Parent
+    end
+    return false
+end
+
 local function removeObject(inst)
     local e = tracked[inst]
     if e then
-        e.box:Destroy()
+        e.hl:Destroy()
         e.label:Destroy()
         tracked[inst] = nil
     end
 end
 
+local OBJECT_NAMES = {Generators = "Генератор", Pallets = "Паллета", Windows = "Окно"}
+
 local function considerObject(inst)
-    if tracked[inst] then return end
+    if tracked[inst] or not inst.Parent then return end
     local kind = classify(inst)
     if not kind then return end
 
@@ -586,35 +662,51 @@ local function considerObject(inst)
         p = p.Parent
     end
 
+    -- фильтр декораций
+    if strictFilter then
+        if inDecorFolder(inst) or not hasInteractive(inst) then
+            skipped[kind] = (skipped[kind] or 0) + 1
+            return
+        end
+    end
+
     local part = getMainPart(inst)
     if not part then return end
 
-    local cf, size
-    if inst:IsA("Model") then
-        cf, size = inst:GetBoundingBox()
-    else
-        cf, size = inst.CFrame, inst.Size
-    end
-
     local color = ESP_COLORS[kind]
-    local box = Instance.new("BoxHandleAdornment")
-    box.Adornee = part
-    box.Size = size
-    box.CFrame = part.CFrame:ToObjectSpace(cf)
-    box.AlwaysOnTop = true
-    box.ZIndex = 5
-    box.Transparency = 0.65
-    box.Color3 = color
-    box.Visible = esp[kind]
-    box.Parent = espFolder
+    local hl = Instance.new("Highlight")
+    hl.Adornee = inst                      -- обводим саму модель, а не коробку
+    hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+    hl.FillTransparency = 0.7
+    hl.OutlineTransparency = 0
+    hl.FillColor = color
+    hl.OutlineColor = color
+    hl.Enabled = false
+    hl.Parent = espFolder
 
-    local names = {Generators = "Генератор", Pallets = "Паллета", Windows = "Окно"}
-    local label = makeLabel(part, names[kind], color)
-    label.Enabled = esp[kind]
+    local label = makeLabel(part, OBJECT_NAMES[kind], color)
 
-    tracked[inst] = {kind = kind, box = box, label = label}
+    tracked[inst] = {kind = kind, hl = hl, label = label, part = part}
     inst.AncestryChanged:Connect(function(_, parent)
         if not parent then removeObject(inst) end
+    end)
+end
+
+local function runScan()
+    task.spawn(function()
+        skipped = {}
+        local n = 0
+        for _, d in ipairs(workspace:GetDescendants()) do
+            pcall(considerObject, d)
+            n += 1
+            if n % 300 == 0 then task.wait() end
+        end
+        local found = {Generators = 0, Pallets = 0, Windows = 0}
+        for _, e in pairs(tracked) do found[e.kind] += 1 end
+        print(string.format(
+            "[District ESP] найдено: генераторы %d, паллеты %d, окна %d | отфильтровано как декорации: %d / %d / %d",
+            found.Generators, found.Pallets, found.Windows,
+            skipped.Generators or 0, skipped.Pallets or 0, skipped.Windows or 0))
     end)
 end
 
@@ -622,25 +714,55 @@ local function scanObjects()
     if objectsScanned then return end
     objectsScanned = true
     workspace.DescendantAdded:Connect(function(d)
-        task.defer(considerObject, d)
+        -- небольшая задержка, чтобы внутри модели успели появиться её части и скрипты
+        task.delay(0.7, function() pcall(considerObject, d) end)
     end)
-    task.spawn(function()
-        local n = 0
-        for _, d in ipairs(workspace:GetDescendants()) do
-            pcall(considerObject, d)
-            n += 1
-            if n % 300 == 0 then task.wait() end
+    runScan()
+end
+
+-- Лимит Roblox: одновременно рисуется ~31 Highlight, поэтому подсвечиваем ближайшие объекты
+local function updateObjects()
+    local cam = workspace.CurrentCamera
+    local camPos = cam and cam.CFrame.Position
+    local usedByPlayers = 0
+    for _, e in pairs(playerObjs) do
+        if e.hl.Enabled then usedByPlayers += 1 end
+    end
+    local budget = HIGHLIGHT_LIMIT - usedByPlayers
+
+    local list = {}
+    for _, e in pairs(tracked) do
+        if esp[e.kind] then
+            e.label.Enabled = true
+            local ok, dist = pcall(function() return (e.part.Position - camPos).Magnitude end)
+            list[#list + 1] = {e = e, d = ok and dist or 0}
+        else
+            e.hl.Enabled = false
+            e.label.Enabled = false
         end
-    end)
+    end
+    table.sort(list, function(a, b) return a.d < b.d end)
+    for i, item in ipairs(list) do
+        item.e.hl.Enabled = i <= budget
+    end
 end
 
 espRefreshObjects = function()
     if esp.Generators or esp.Pallets or esp.Windows then
         scanObjects()
     end
-    for _, e in pairs(tracked) do
-        local on = esp[e.kind]
-        e.box.Visible = on
-        e.label.Enabled = on
-    end
+    pcall(updateObjects)
 end
+
+espSetStrict = function(on)
+    strictFilter = on
+    for inst in pairs(tracked) do removeObject(inst) end
+    if objectsScanned then runScan() end
+end
+
+task.spawn(function()
+    while screen.Parent do
+        if objectsScanned then pcall(updateObjects) end
+        task.wait(0.5)
+    end
+end)
