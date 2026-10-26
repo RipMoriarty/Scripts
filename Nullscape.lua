@@ -44,6 +44,9 @@ local CFG = {
     magnet = 5,           -- gift collection range added at round start (0 = off), like the old GUI
     voidGuard = false,    -- teleport to spawn when falling into the void (can pin you to spawn if the void plane is high)
     avoidEnemies = false, -- treat enemies as obstacles when god mode is OFF
+    noclip = true,        -- no collisions while the script moves you (stops being flung out of the map)
+    bounds = true,        -- ignore gifts that lie far outside the level
+    useRemote = false,    -- fallback: fire the GiftCollected remote when touching a gift did not work (risky)
     showZones = false,    -- draw mine danger zones
     beaconWaitPassage = true,
     noNeedGrace = 25,
@@ -53,21 +56,26 @@ local CFG = {
 -- per intermission type: how many picks per break, and what/how many to pick
 -- entries are matched (plain text, lowercase) against the altar text; max = 0 means unlimited
 local PICKS = {
-    ENEMIES  = { perBreak = 1, any = false, avoid = "", entries = {} },
-    CURSES   = { perBreak = 1, any = false, avoid = "", entries = {} },
-    UPGRADES = { perBreak = 1, any = false, avoid = "", entries = {} },
+    ENEMIES  = { perBreak = 1, any = false, avoid = "", centerLast = false, entries = {} },
+    CURSES   = { perBreak = 1, any = false, avoid = "", centerLast = false, entries = {} },
+    GREATER  = { perBreak = 1, any = false, avoid = "", centerLast = false, entries = {} },
+    UPGRADES = { perBreak = 1, any = false, avoid = "", centerLast = true,  entries = {} },
+    NEW      = { perBreak = 1, any = false, avoid = "", centerLast = false, entries = {} },
 }
+local SIGNMAP = {}  -- sign image id -> category, learned from the Picks tab and saved
 local TYPE_TITLES = {
     ENEMIES = "Enemies (intermission)",
     CURSES = "Curses (intermission)",
+    GREATER = "Greater curses (intermission)",
     UPGRADES = "Upgrades (intermission)",
+    NEW = "New shop (intermission)",
 }
-local TYPE_ORDER = { "ENEMIES", "CURSES", "UPGRADES" }
+local TYPE_ORDER = { "ENEMIES", "CURSES", "GREATER", "UPGRADES", "NEW" }
 
 local running = true
 local conns = {}
 local state = { action = "idle" }
-local diag = { total = 0, visible = 0, withCollect = 0, visits = 0, collected = 0, failed = 0, unsafe = 0, noRoute = 0, countAt = 0, log = {} }
+local diag = { total = 0, visible = 0, withCollect = 0, visits = 0, collected = 0, failed = 0, unsafe = 0, noRoute = 0, countAt = 0, outside = 0, log = {} }
 
 local function logEvent(text)
     local log = diag.log
@@ -76,7 +84,7 @@ local function logEvent(text)
     log[#log + 1] = stamp .. " " .. text
     while #log > 7 do table.remove(log, 1) end
 end
-local breakPicks = { ENEMIES = 0, CURSES = 0, UPGRADES = 0 }
+local breakPicks = { ENEMIES = 0, CURSES = 0, GREATER = 0, UPGRADES = 0, NEW = 0 }
 local UI = {}  -- filled by the GUI builder (refresh hooks)
 
 ------------------------------------------------------------------ save / load
@@ -85,12 +93,12 @@ local SAVED_CFG_KEYS = { "collectAll", "speed", "mineMargin", "predict", "lookah
     "avoidEnemies", "beaconWaitPassage", "magnet" }
 
 local function serialize()
-    local t = { v = 4, cfg = {}, picks = {} }
+    local t = { v = 4, cfg = {}, picks = {}, signs = SIGNMAP }
     for _, k in ipairs(SAVED_CFG_KEYS) do t.cfg[k] = CFG[k] end
     for typ, p in pairs(PICKS) do
         local es = {}
         for _, e in ipairs(p.entries) do es[#es + 1] = { text = e.text, max = e.max } end
-        t.picks[typ] = { perBreak = p.perBreak, any = p.any, avoid = p.avoid, entries = es }
+        t.picks[typ] = { perBreak = p.perBreak, any = p.any, avoid = p.avoid, centerLast = p.centerLast, entries = es }
     end
     return HttpService:JSONEncode(t)
 end
@@ -124,6 +132,7 @@ local function loadSaved()
                 p.perBreak = tonumber(d.perBreak) or p.perBreak
                 p.any = d.any == true
                 p.avoid = type(d.avoid) == "string" and d.avoid or ""
+                if d.centerLast ~= nil then p.centerLast = d.centerLast == true end
                 p.entries = {}
                 for _, e in ipairs(d.entries or {}) do
                     if type(e.text) == "string" and e.text ~= "" then
@@ -131,6 +140,11 @@ local function loadSaved()
                     end
                 end
             end
+        end
+    end
+    if type(data.signs) == "table" then
+        for id, cat in pairs(data.signs) do
+            if type(id) == "string" and type(cat) == "string" and PICKS[cat] then SIGNMAP[id] = cat end
         end
     end
 end
@@ -270,6 +284,46 @@ local function resetMagnet(full)
         end
     end)
 end
+
+-- noclip + zero velocity while the script moves the character: tweening through walls with collisions
+-- switched on makes the physics engine throw the character out of the map
+local noclipSaved = setmetatable({}, { __mode = "k" })
+local noclipUntil = 0
+
+local function keepMoving(seconds)
+    noclipUntil = math.max(noclipUntil, tick() + (seconds or 1.5))
+end
+
+local function restoreNoclip()
+    for part, orig in pairs(noclipSaved) do
+        if part.Parent then part.CanCollide = orig end
+        noclipSaved[part] = nil
+    end
+end
+
+local function noclipStep()
+    if not running then return end
+    local char = plr.Character
+    if not char then return end
+    if tick() < noclipUntil then
+        local root = char:FindFirstChild("HumanoidRootPart")
+        if root then
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+        end
+        if CFG.noclip then
+            for _, d in ipairs(char:GetDescendants()) do
+                if d:IsA("BasePart") then
+                    if noclipSaved[d] == nil then noclipSaved[d] = d.CanCollide end
+                    d.CanCollide = false
+                end
+            end
+        end
+    else
+        restoreNoclip()
+    end
+end
+conns[#conns + 1] = RS.Stepped:Connect(noclipStep)
 
 -- a gift / mine may be a part or a model: return the part that carries position / transparency
 local function partOf(c)
@@ -523,6 +577,46 @@ local function exploreStream()
     end
 end
 
+local boundsAt, boundsMin, boundsMax = 0, nil, nil
+local function levelBounds()
+    if tick() - boundsAt < 2 then return boundsMin, boundsMax end
+    boundsAt = tick()
+    local mn, mx = nil, nil
+    local function add(c, r)
+        local lo = Vector3.new(c.X - r, c.Y - r, c.Z - r)
+        local hi = Vector3.new(c.X + r, c.Y + r, c.Z + r)
+        if not mn then
+            mn, mx = lo, hi
+        else
+            mn = Vector3.new(math.min(mn.X, lo.X), math.min(mn.Y, lo.Y), math.min(mn.Z, lo.Z))
+            mx = Vector3.new(math.max(mx.X, hi.X), math.max(mx.Y, hi.Y), math.max(mx.Z, hi.Z))
+        end
+    end
+    local n = 0
+    for _, r in ipairs(currentRooms:GetChildren()) do
+        if r:IsA("Model") then
+            local ok, cf, size = pcall(function() return r:GetBoundingBox() end)
+            if ok and cf and size then
+                add(cf.Position, size.Magnitude / 2)
+                n += 1
+            end
+        end
+    end
+    if n == 0 then
+        boundsMin, boundsMax = nil, nil
+        return nil, nil
+    end
+    if spawnPart then add(spawnPart.Position, 60) end
+    local b = workspace:FindFirstChild("Beacon")
+    if b then
+        local ok, pos = pcall(function() return b:IsA("Model") and b:GetPivot().Position or b.Position end)
+        if ok then add(pos, 60) end
+    end
+    local m = Vector3.new(150, 150, 150)
+    boundsMin, boundsMax = mn - m, mx + m
+    return boundsMin, boundsMax
+end
+
 local giftCache, giftSet, giftCacheAt = {}, setmetatable({}, { __mode = "k" }), 0
 
 local function rebuildGiftCache(force)
@@ -557,6 +651,12 @@ local function pickCandidates(root, useNormal, useGolden, limit)
     local rp = root.Position
     local kv = workspace:FindFirstChild("KillVoid")
     local minY = kv and (kv.Position.Y + 30) or -1e9
+    local bmin, bmax = nil, nil
+    if CFG.bounds then bmin, bmax = levelBounds() end
+    local function inBounds(p)
+        if not bmin then return true end
+        return p.X > bmin.X and p.X < bmax.X and p.Y > bmin.Y and p.Y < bmax.Y and p.Z > bmin.Z and p.Z < bmax.Z
+    end
     local now = tick()
     local cap = limit * 3
     local near = {}
@@ -576,7 +676,7 @@ local function pickCandidates(root, useNormal, useGolden, limit)
             and ((e.golden and useGolden) or (not e.golden and useNormal))
             and not (blacklist[g] and blacklist[g] > now) then
             local pos = g.Position
-            if pos.Y > minY then
+            if pos.Y > minY and inBounds(pos) then
                 local d = (pos - rp).Magnitude
                 if #near < cap or d < near[#near].d then consider(e, d) end
             end
@@ -586,7 +686,7 @@ local function pickCandidates(root, useNormal, useGolden, limit)
     for _, g in ipairs(foundGifts) do
         if g.Parent and not giftSet[g] and g.Transparency ~= 1 and not (blacklist[g] and blacklist[g] > now) then
             local golden = (g.Name .. " " .. g.Parent.Name):lower():find("golden", 1, true) ~= nil
-            if (golden and useGolden) or (not golden and useNormal) then
+            if ((golden and useGolden) or (not golden and useNormal)) and inBounds(g.Position) then
                 local d = (g.Position - rp).Magnitude
                 if #near < cap or d < near[#near].d then consider({ part = g, obj = g, golden = golden }, d) end
             end
@@ -639,6 +739,13 @@ local function followRoute(route, g)
                     c:Disconnect()
                     return "done"
                 end
+                keepMoving()
+                if (g.Position - route[#route]).Magnitude > 4 then
+                    -- the pooled gift was moved to another place while we were flying: plan again
+                    cancelTweens(t1, t2)
+                    c:Disconnect()
+                    return "replan"
+                end
                 updateObstacles()
                 if tick() - lastNear > 0.2 then
                     lastNear = tick()
@@ -667,6 +774,7 @@ end
 
 local function visit(g)
     diag.visits += 1
+    keepMoving()
     for _ = 1, 4 do
         local _, root = charParts()
         if not root then return false end
@@ -699,11 +807,37 @@ local function visit(g)
             local t0 = tick()
             while stillThere(g, hadCollect) and tick() - t0 < 0.6 do task.wait(0.03) end
             if stillThere(g, hadCollect) then
-                -- touch did not register: put root + hitbox exactly on the gift once more
+                -- touch did not register: put root + hitbox on the gift again and poke the touch event
+                keepMoving()
                 local _, r2, h2 = charParts()
                 if r2 then snap(r2, h2, g.Position) end
+                if firetouchinterest and h2 then
+                    pcall(function()
+                        firetouchinterest(h2, g, 0)
+                        firetouchinterest(h2, g, 1)
+                    end)
+                end
                 t0 = tick()
-                while stillThere(g, hadCollect) and tick() - t0 < 0.5 do task.wait(0.03) end
+                while stillThere(g, hadCollect) and tick() - t0 < 0.4 do task.wait(0.03) end
+            end
+            if stillThere(g, hadCollect) then
+                -- wiggle through the gift from above and from below
+                local _, r3, h3 = charParts()
+                if r3 then
+                    for _, off in ipairs({ Vector3.new(0, 3, 0), Vector3.new(0, -3, 0), Vector3.zero }) do
+                        snap(r3, h3, g.Position + off)
+                        task.wait(0.08)
+                        if not stillThere(g, hadCollect) then break end
+                    end
+                end
+            end
+            if stillThere(g, hadCollect) and CFG.useRemote then
+                pcall(function()
+                    local ev = ReplicatedStorage:FindFirstChild("Events")
+                    local rem = ev and ev:FindFirstChild("GiftCollected")
+                    if rem and rem:IsA("RemoteEvent") then rem:FireServer(g) end
+                end)
+                task.wait(0.2)
             end
             if stillThere(g, hadCollect) then
                 blacklist[g] = tick() + 8
@@ -723,14 +857,19 @@ end
 ------------------------------------------------------------------ diagnostics
 local function countGifts()
     rebuildGiftCache(true)
-    local vis, withC = 0, 0
+    local bmin, bmax = levelBounds()
+    local vis, withC, outside = 0, 0, 0
     for _, e in ipairs(giftCache) do
         if not e.parked and e.part.Parent and e.part.Transparency ~= 1 then
             vis += 1
+            local p = e.part.Position
+            if bmin and not (p.X > bmin.X and p.X < bmax.X and p.Y > bmin.Y and p.Y < bmax.Y and p.Z > bmin.Z and p.Z < bmax.Z) then
+                outside += 1
+            end
             if hasCollect(e) then withC += 1 end
         end
     end
-    diag.total, diag.visible, diag.withCollect = #giftCache, vis, withC
+    diag.total, diag.visible, diag.withCollect, diag.outside = #giftCache, vis, withC, outside
 end
 
 local function diagGifts()
@@ -796,8 +935,11 @@ local function diagGifts()
     countGifts()
     local parked = 0
     for _, e in ipairs(giftCache) do if e.parked then parked += 1 end end
-    out[#out + 1] = string.format("gift parts=%d visible=%d collectable(Collect)=%d parked-ignored=%d | visits=%d collected=%d failed=%d unsafe=%d noRoute=%d",
-        diag.total, diag.visible, diag.withCollect, parked, diag.visits, diag.collected, diag.failed, diag.unsafe, diag.noRoute)
+    out[#out + 1] = string.format("gift parts=%d visible=%d collectable(Collect)=%d parked-ignored=%d outside-level=%d | visits=%d collected=%d failed=%d unsafe=%d noRoute=%d",
+        diag.total, diag.visible, diag.withCollect, parked, diag.outside, diag.visits, diag.collected, diag.failed, diag.unsafe, diag.noRoute)
+    local bmn, bmx = levelBounds()
+    out[#out + 1] = bmn and string.format("level bounds: min=(%.0f,%.0f,%.0f) max=(%.0f,%.0f,%.0f)", bmn.X, bmn.Y, bmn.Z, bmx.X, bmx.Y, bmx.Z)
+        or "level bounds: unknown (no rooms yet)"
     local shown = 0
     for pass = 1, 2 do
         for _, e in ipairs(giftCache) do
@@ -896,12 +1038,14 @@ local function signImage()
     return sel, img and tostring(img.Image) or nil
 end
 
--- ENEMIES / CURSES / UPGRADES, "UNKNOWN" if the sign image is not recognised, nil if there is no Select model
+-- shop category, "UNKNOWN" (plus the sign id) if the sign image is not recognised, nil if there is no Select model
 local function intermissionType()
     local sel, image = signImage()
     if not sel then return nil end
     local id = image and image:match("%d+")
-    return (id and IMAGES[id]) or "UNKNOWN"
+    local cat = id and (SIGNMAP[id] or IMAGES[id])
+    if cat and PICKS[cat] then return cat, id end
+    return "UNKNOWN", id
 end
 
 local function stripTags(str)
@@ -943,30 +1087,46 @@ local function matchesAny(text, csv)
     return false
 end
 
--- returns prompt, entry (nil when picked via "pick any"), category
-local function chooseIn(prompts, cat, allowAny)
-    local cfg = PICKS[cat]
-    if not cfg or cfg.perBreak <= 0 or breakPicks[cat] >= cfg.perBreak then return nil end
-    local free = {}
-    for _, p in ipairs(prompts) do
-        if not (used[p] and tick() - used[p] < 20) then free[#free + 1] = p end
-    end
+local altarRole = setmetatable({}, { __mode = "k" })
+
+-- the first altar of `list` that matches the wanted list (in priority order), then "pick any"
+local function matchIn(list, cfg, allowAny)
     for _, e in ipairs(cfg.entries) do
         if e.max == 0 or e.used < e.max then
-            for _, p in ipairs(free) do
+            for _, p in ipairs(list) do
                 if altarName(p):find(e.text, 1, true) then return p, e end
             end
-            for _, p in ipairs(free) do
+            for _, p in ipairs(list) do
                 if promptText(p):find(e.text, 1, true) then return p, e end
             end
         end
     end
     if allowAny and cfg.any then
-        for _, p in ipairs(free) do
+        for _, p in ipairs(list) do
             if not matchesAny(promptText(p), cfg.avoid) then return p, nil end
         end
     end
     return nil
+end
+
+-- returns prompt, entry (nil when picked via "pick any"), category
+local function chooseIn(prompts, cat, allowAny)
+    local cfg = PICKS[cat]
+    if not cfg or cfg.perBreak <= 0 or breakPicks[cat] >= cfg.perBreak then return nil end
+    local free, sides, centers = {}, {}, {}
+    for _, p in ipairs(prompts) do
+        if not (used[p] and tick() - used[p] < 20) then
+            free[#free + 1] = p
+            if altarRole[p] == "center" then centers[#centers + 1] = p else sides[#sides + 1] = p end
+        end
+    end
+    if cfg.centerLast and #centers > 0 then
+        -- the centre altar only when neither the left nor the right altar can be taken
+        local p, e = matchIn(sides, cfg, allowAny)
+        if p then return p, e end
+        return matchIn(centers, cfg, allowAny)
+    end
+    return matchIn(free, cfg, allowAny)
 end
 
 local function choose(prompts, typ)
@@ -991,12 +1151,63 @@ local function promptPos(p)
     return nil
 end
 
+-- left / center / right: sort the shop altars along the line they stand on; the middle one is the centre
+local function computeRoles()
+    local sel = workspace:FindFirstChild("Select")
+    if not sel then return end
+    local all, numbered = {}, {}
+    for _, d in ipairs(sel:GetDescendants()) do
+        if d:IsA("ProximityPrompt") then
+            local pos = promptPos(d)
+            if pos then
+                local e = { p = d, pos = pos }
+                all[#all + 1] = e
+                local a = d.Parent
+                while a and a ~= sel do
+                    if a.Name:match("^%d+$") then
+                        numbered[#numbered + 1] = e
+                        break
+                    end
+                    a = a.Parent
+                end
+            end
+        end
+    end
+    if #numbered >= 2 then all = numbered end
+    if #all < 3 then
+        for _, e in ipairs(all) do altarRole[e.p] = "side" end
+        return
+    end
+    local mx, mz = 0, 0
+    for _, e in ipairs(all) do
+        mx += e.pos.X
+        mz += e.pos.Z
+    end
+    mx /= #all
+    mz /= #all
+    local sxx, szz, sxz = 0, 0, 0
+    for _, e in ipairs(all) do
+        local dx, dz = e.pos.X - mx, e.pos.Z - mz
+        sxx += dx * dx
+        szz += dz * dz
+        sxz += dx * dz
+    end
+    local ang = 0.5 * math.atan2(2 * sxz, sxx - szz)
+    local ax, az = math.cos(ang), math.sin(ang)
+    for _, e in ipairs(all) do e.t = (e.pos.X - mx) * ax + (e.pos.Z - mz) * az end
+    table.sort(all, function(a, b) return a.t < b.t end)
+    for i, e in ipairs(all) do
+        altarRole[e.p] = (i == 1 or i == #all) and "side" or "center"
+    end
+end
+
 local function activate(p)
     if not fireproximityprompt then
         notify("Your executor has no fireproximityprompt")
         return false
     end
     used[p] = tick()
+    keepMoving(4)
     local _, root, hitbox = charParts()
     if not root then return false end
     local pos, part = promptPos(p)
@@ -1032,6 +1243,7 @@ local function goBeacon()
     if not root then return end
     local pos = b:IsA("Model") and b:GetPivot().Position or b.Position
     snap(root, hitbox, safeNear(pos + Vector3.new(0, 4, 0)))
+    keepMoving(2)
 end
 
 local function names(folder)
@@ -1454,6 +1666,9 @@ cfgToggle(pMain, "Auto go to beacon  [V]", "beacon")
 cfgToggle(pMain, "Collect ALL gifts (not only needed)", "collectAll")
 cfgToggle(pMain, "Wait for passage gifts before beacon", "beaconWaitPassage")
 cfgToggle(pMain, "Void guard (back to spawn when falling)", "voidGuard")
+cfgToggle(pMain, "Noclip while moving (stops being flung)", "noclip")
+cfgToggle(pMain, "Ignore gifts outside the level", "bounds")
+cfgToggle(pMain, "Fallback: GiftCollected remote (risky)", "useRemote")
 addSlider(pMain, "Move speed (studs/s)", "speed", 40, 200, 5, "%d")
 addSlider(pMain, "Gift range at round start (0 = off)", "magnet", 0, 30, 1, "%d")
 addButton(pMain, "Apply gift range now", function() applyMagnet() end)
@@ -1499,6 +1714,39 @@ addLabel(pInfo, "Nullscape GUI by Rip_Moriarty. Settings are saved to NullscapeG
 
 -- Picks
 addLabel(pPicks, "What the cheat takes at the altars during a break. Entries are tried top to bottom; 'x/y' = times taken / maximum (y = inf means unlimited). 'Picks per break' = how many altars of that type are taken in one break (0 = skip the type).", 98)
+
+-- shown when a shop sign is not recognised: one click tells the script what kind of shop it is
+local unkRow = addRow(pPicks, 66)
+unkRow.Visible = false
+local unkLabel = new("TextLabel", {
+    BackgroundTransparency = 1, Position = UDim2.fromOffset(8, 4), Size = UDim2.new(1, -16, 0, 22), Text = "",
+    Font = Enum.Font.GothamBold, TextSize = 13, TextColor3 = THEME.accent, TextXAlignment = Enum.TextXAlignment.Left,
+}, unkRow)
+local UNK_CATS = {
+    { "ENEMIES", "Enemies" }, { "CURSES", "Curses" }, { "GREATER", "Greater" }, { "UPGRADES", "Upgrades" }, { "NEW", "New shop" },
+}
+for i, c in ipairs(UNK_CATS) do
+    local b = new("TextButton", {
+        Size = UDim2.new(0.2, -6, 0, 26), Position = UDim2.new((i - 1) * 0.2, 4, 0, 32), BackgroundColor3 = THEME.accent,
+        Text = c[2], Font = Enum.Font.GothamBold, TextSize = 12, TextColor3 = Color3.new(1, 1, 1), AutoButtonColor = true,
+        BorderSizePixel = 0,
+    }, unkRow)
+    corner(b, 5)
+    b.MouseButton1Click:Connect(function()
+        if UI.unknownId then
+            SIGNMAP[UI.unknownId] = c[1]
+            saveSoon()
+            notify("Shop sign " .. UI.unknownId .. " = " .. c[2])
+            UI.unknownId = nil
+            unkRow.Visible = false
+        end
+    end)
+end
+function UI.showUnknown(id)
+    UI.unknownId = id
+    unkLabel.Text = "Unrecognised shop sign (id " .. id .. "). What shop is this?"
+    unkRow.Visible = true
+end
 
 local function buildPicksSection(typ)
     local cfg = PICKS[typ]
@@ -1618,6 +1866,7 @@ local function buildPicksSection(typ)
     results.LayoutOrder = pPicks:order()
 
     addToggle(pPicks, "Pick any altar if nothing matches", function() return cfg.any end, function(v) cfg.any = v end)
+    addToggle(pPicks, "Center altar only if left/right can't be picked", function() return cfg.centerLast == true end, function(v) cfg.centerLast = v end)
     local avoidRow = addTextBoxRow(pPicks, "avoid words, comma separated (used by 'pick any')", "Set", function(text)
         cfg.avoid = (text or ""):lower()
         saveSoon()
@@ -1655,6 +1904,7 @@ end)
 stop = function()
     if not running then return end
     running = false
+    pcall(restoreNoclip)
     if magnetApplied then resetMagnet(true) end
     for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
     pcall(function() zoneFolder:Destroy() end)
@@ -1869,6 +2119,10 @@ conns[#conns + 1] = RS.Heartbeat:Connect(function()
     if not running then return end
     local _, root, hb = charParts()
     if root and hb then hb.Position = root.Position end
+    if root and tick() < noclipUntil then
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.AssemblyAngularVelocity = Vector3.zero
+    end
 end)
 
 conns[#conns + 1] = RS.Heartbeat:Connect(function()
@@ -1912,8 +2166,14 @@ task.spawn(function()
     while running do
         task.wait(1)
         if not CFG.choose or inRound.Value then continue end
-        local typ = intermissionType()
+        local typ, signId = intermissionType()
         if not typ then continue end
+        if typ == "UNKNOWN" and signId and UI.showUnknown and UI.unknownShown ~= signId then
+            UI.unknownShown = signId
+            UI.showUnknown(signId)
+            notify("New shop sign (id " .. signId .. "): assign it in the Picks tab")
+        end
+        pcall(computeRoles)
         local prompts = collectPrompts()
         if #prompts == 0 then continue end
 
