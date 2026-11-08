@@ -3,10 +3,12 @@
 
 Берёт готовый пак с пластинками героев (базовый zip) и добавляет к нему:
   * 10 иконок предметов (6 имплантов и 4 детали) с моделями по CustomModelData,
+  * модели киберпсихов и дронов-стрелков (детали-«дисплеи», см. cyber_mobs.py; они же подключаются через CustomModelData),
   * свои звуки: установка импланта, Сандевистан, сдача деталей, фоновая музыка города (всё синтезируется кодом).
 
 Запуск:  python3 make_cyber_pack.py <базовый.zip> <выход.zip> [каталог-для-предпросмотра]
 Нужны только Pillow, numpy и ffmpeg (libvorbis). Результат от запуска к запуску одинаковый.
+Рядом должен лежать cyber_mobs.py.
 """
 import json
 import math
@@ -18,6 +20,9 @@ import zipfile
 
 import numpy as np
 from PIL import Image
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import cyber_mobs  # noqa: E402
 
 SR = 44100
 
@@ -631,10 +636,18 @@ def build(base, out, preview=None):
 
     by_base = {}
     for name, base_item, cmd in MODELS:
-        by_base.setdefault(base_item, []).append((cmd, name))
+        by_base.setdefault(base_item, []).append((cmd, 'kniga:item/cyber/%s' % name))
+
+    mob_files, mob_models = cyber_mobs.files(png_bytes)
+    files.update(mob_files)
+    for cmd, model in mob_models:                          # детали моделей мобов — предметы на основе светящегося мешочка
+        by_base.setdefault('glow_ink_sac', []).append((cmd, model))
+
     for base_item, lst in by_base.items():
+        # предикат custom_model_data срабатывает «от и выше», побеждает последний подходящий, поэтому — по возрастанию
+        lst.sort()
         model = {'parent': 'minecraft:item/generated', 'textures': {'layer0': 'minecraft:item/%s' % base_item},
-                 'overrides': [{'predicate': {'custom_model_data': cmd}, 'model': 'kniga:item/cyber/%s' % name} for cmd, name in lst]}
+                 'overrides': [{'predicate': {'custom_model_data': cmd}, 'model': path} for cmd, path in lst]}
         files['assets/minecraft/models/item/%s.json' % base_item] = json.dumps(model, indent=2).encode('utf-8')
 
     events = {}
