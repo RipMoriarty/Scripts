@@ -94,8 +94,8 @@
 Нужны три строки в `server.properties` (ссылка и хеш относятся к этой версии архива):
 
 ```properties
-resource-pack=https://raw.githubusercontent.com/RipMoriarty/Scripts/facb73c9b84300ed3d3656b8e237589ca27740e6/kniga-pack/KnigaPack.zip
-resource-pack-sha1=5a6181f0facfe97b5104a2f257c353cdd792ec88
+resource-pack=https://raw.githubusercontent.com/RipMoriarty/Scripts/7d4fb0cf067d5cc0d2bf07f257834d80bc2b8afb/kniga-pack/KnigaPack.zip
+resource-pack-sha1=f14d5c77fbf35e79c334c6425792393edf2571c3
 require-resource-pack=true
 ```
 
@@ -114,7 +114,7 @@ resource-pack-prompt={"text":"\u041a\u043d\u0438\u0433\u0430 \u0421\u0443\u0434\
 
 Важно:
 
-- Ссылка должна вести прямо на файл (`raw.githubusercontent.com`), а не на страницу GitHub. Ссылка выше привязана к коммиту `facb73c`, поэтому содержимое по ней не изменится, даже если ветку потом обновят.
+- Ссылка должна вести прямо на файл (`raw.githubusercontent.com`), а не на страницу GitHub. Ссылка выше привязана к коммиту `7d4fb0c`, поэтому содержимое по ней не изменится, даже если ветку потом обновят.
 - `resource-pack-sha1` — 40 символов строчными буквами, без пробелов. Если хеш не совпадёт с файлом, клиент не примет пак.
 - Пустой `resource-pack` с `require-resource-pack=true` ничего не требует: сначала должна быть рабочая ссылка.
 
@@ -149,5 +149,5 @@ python3 realm_mobs.py папка_для_превью   # то же для моб
 - `assets/minecraft/lang/{ru_ru,en_us,uk_ua,be_by}.json` — названия дисков
 - `assets/minecraft/models/item/*.json` — модели-основы с подменой по `custom_model_data` (иконки и части мобов)
 - `assets/kniga/textures/item/{cyber,medieval,shinigami}/*.png`, `assets/kniga/models/item/{cyber,medieval,shinigami}/*.json` — иконки (10 киберпанка и по 10 на каждый новый мир)
-- `assets/kniga/textures/cyber/mob/{psycho,drone,knight,bandit,soul,reaper}.png`, `assets/kniga/models/cyber/mob/*.json` — текстуры и 27 моделей мобов
+- `assets/kniga/textures/item/cyber/mob/{psycho,drone,knight,bandit,soul,reaper}.png`, `assets/kniga/models/cyber/mob/*.json` — текстуры и 27 моделей мобов. Текстуры лежат в `textures/item/` не случайно: с 1.19.3 игра берёт в атлас только папки `block/` и `item/`, всё остальное показывает как «пропавшую» текстуру (розово-чёрную). Координаты текстуры в моделях записаны в долях 0–16, как требует игра (не в пикселях)
 - `assets/kniga/sounds.json`, `assets/kniga/sounds/{cyber,medieval,shinigami}/*.ogg` — звуки и фоновая музыка
