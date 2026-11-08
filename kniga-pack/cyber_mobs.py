@@ -91,8 +91,12 @@ class Box:
         }[f]
 
     def uv(self, f):
+        """Координаты текстуры в модели — всегда в долях 0–16, а не в пикселях (ключ texture_size игра не читает)."""
         x, y, w, h = self.region(f)
-        return [x, y, x + w, y + h]
+        k = 16.0 / SIZE
+        if f == 'down':                                   # у нижней грани игра кладёт верх картинки на южный край, а мы рисуем с северного
+            return [x * k, (y + h) * k, (x + w) * k, y * k]
+        return [x * k, y * k, (x + w) * k, (y + h) * k]
 
     def put(self, f, x, y, c, a=255):
         rx, ry, rw, rh = self.region(f)
@@ -155,7 +159,7 @@ class Mob:
         return p
 
     def tex_ref(self):
-        return 'kniga:cyber/mob/%s' % self.name
+        return 'kniga:item/cyber/mob/%s' % self.name      # текстуры вне папок block/ и item/ игра в атлас не берёт (с 1.19.3)
 
 
 # ----------------------------------------------------------------------------------------------
@@ -409,16 +413,34 @@ def all_mobs():
 # Файлы пака
 # ----------------------------------------------------------------------------------------------
 
+def check_models(out):
+    """Проверка готовых JSON так, как их читает игра: каждая грань — в долях 0–16, и по ним находится нужный кусок картинки."""
+    n = 0
+    for path, data in out.items():
+        if not path.startswith('assets/kniga/models/cyber/mob/'):
+            continue
+        m = json.loads(data.decode('utf-8'))
+        for e in m['elements']:
+            for f, face in e['faces'].items():
+                u = face['uv']
+                assert len(u) == 4 and all(0.0 <= v <= 16.0 for v in u), '%s: грань %s вне 0–16: %s' % (path, f, u)
+                px = [v * SIZE / 16.0 for v in u]
+                assert all(abs(v - round(v)) < 1e-6 for v in px), '%s: грань %s не по пикселям: %s' % (path, f, u)
+                n += 1
+    return n
+
+
 def files(png_bytes, mobs=None):
     """путь в архиве → байты; плюс список (имя части, CustomModelData, модель) для переопределений предмета."""
     out = {}
     models = []
     for m in (mobs if mobs is not None else all_mobs()):
-        out['assets/kniga/textures/cyber/mob/%s.png' % m.name] = png_bytes(m.sheet.image())
+        out['assets/kniga/textures/item/cyber/mob/%s.png' % m.name] = png_bytes(m.sheet.image())
         for p in m.parts:
             name = '%s_%s' % (m.name, p.name)
             out['assets/kniga/models/cyber/mob/%s.json' % name] = json.dumps(p.model(m.tex_ref()), indent=1).encode('utf-8')
             models.append((p.cmd, 'kniga:cyber/mob/%s' % name))
+    check_models(out)
     return out, models
 
 

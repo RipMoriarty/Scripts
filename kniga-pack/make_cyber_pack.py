@@ -623,6 +623,29 @@ def png_bytes(im):
     return b.getvalue()
 
 
+def check_pack(files):
+    """Ссылки между файлами так, как их читает игра (1.20.1): модели найдены, текстуры лежат в папках атласа, номера не повторяются."""
+    for path, data in files.items():
+        if not (path.startswith('assets/') and '/models/' in path and path.endswith('.json')):
+            continue
+        m = json.loads(data.decode('utf-8'))
+        for tex in m.get('textures', {}).values():
+            ns, _, rel = tex.partition(':') if ':' in tex else ('minecraft', '', tex)
+            if ns == 'minecraft':
+                continue                                       # ванильные текстуры есть в самой игре
+            assert rel.startswith(('item/', 'block/')), '%s: текстура %s вне папок атласа block/ и item/ (игра покажет «пропавшую»)' % (path, tex)
+            assert 'assets/%s/textures/%s.png' % (ns, rel) in files, '%s: нет текстуры %s' % (path, tex)
+        for e in m.get('elements', []):
+            for f, face in e['faces'].items():
+                assert all(0.0 <= v <= 16.0 for v in face['uv']), '%s: грань %s вне 0–16' % (path, f)
+        if path.startswith('assets/minecraft/models/item/'):
+            cmds = [o['predicate']['custom_model_data'] for o in m.get('overrides', [])]
+            assert cmds == sorted(cmds) and len(set(cmds)) == len(cmds), '%s: номера моделей' % path
+            for o in m.get('overrides', []):
+                ns, _, rel = o['model'].partition(':')
+                assert 'assets/%s/models/%s.json' % (ns, rel) in files, '%s: нет модели %s' % (path, o['model'])
+
+
 def build(base, out, preview=None):
     files = {}                                              # путь в архиве -> байты
     with zipfile.ZipFile(base) as z:
@@ -671,6 +694,7 @@ def build(base, out, preview=None):
             events[ev] = {'sounds': [{'name': 'kniga:%s' % rel, 'stream': stream}]}
     files['assets/kniga/sounds.json'] = json.dumps(events, indent=2).encode('utf-8')
 
+    check_pack(files)
     order = sorted(files)
     with zipfile.ZipFile(out, 'w') as z:
         for n in order:
