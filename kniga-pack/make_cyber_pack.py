@@ -23,6 +23,8 @@ from PIL import Image
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import cyber_mobs  # noqa: E402
+import realm_mobs  # noqa: E402
+import realm_pack  # noqa: E402
 
 SR = 44100
 
@@ -603,6 +605,12 @@ SOUNDS = [  # событие, файл, функция, каналов, стри
     ('cyber.ambient', 'cyber/ambient', snd_ambient, 2, True),
 ]
 
+# миры-походы (средневековье, мир богов смерти): иконки, номера моделей и звуки живут в realm_pack.py
+_SELF = sys.modules[__name__]
+ICONS.update(realm_pack.icons(_SELF))
+MODELS.extend(realm_pack.MODELS)
+SOUNDS.extend(realm_pack.sounds(_SELF))
+
 
 # ----------------------------------------------------------------------------------------------
 # Сборка
@@ -623,30 +631,34 @@ def build(base, out, preview=None):
                 files[n] = z.read(n)
 
     mc = json.loads(files['pack.mcmeta'].decode('utf-8'))
-    mc['pack']['description'] = '§6Книга Судеб §7— пластинки героев и ночной город'
+    mc['pack']['description'] = '§6Книга Судеб §7— пластинки героев, ночной город, королевство и мир богов смерти'
     files['pack.mcmeta'] = json.dumps(mc, ensure_ascii=False, indent=2).encode('utf-8')
 
     imgs = {}
+    def ipath(name):                                        # иконки города лежат в item/cyber, миров — в item/medieval и item/shinigami
+        return name if '/' in name else 'cyber/' + name
+
     for name, fn in ICONS.items():
         im = fn().image()
         imgs[name] = im
-        files['assets/kniga/textures/item/cyber/%s.png' % name] = png_bytes(im)
-        files['assets/kniga/models/item/cyber/%s.json' % name] = json.dumps(
-            {'parent': 'minecraft:item/generated', 'textures': {'layer0': 'kniga:item/cyber/%s' % name}}, indent=2).encode('utf-8')
+        files['assets/kniga/textures/item/%s.png' % ipath(name)] = png_bytes(im)
+        files['assets/kniga/models/item/%s.json' % ipath(name)] = json.dumps(
+            {'parent': 'minecraft:item/generated', 'textures': {'layer0': 'kniga:item/%s' % ipath(name)}}, indent=2).encode('utf-8')
 
     by_base = {}
     for name, base_item, cmd in MODELS:
-        by_base.setdefault(base_item, []).append((cmd, 'kniga:item/cyber/%s' % name))
+        by_base.setdefault(base_item, []).append((cmd, 'kniga:item/%s' % ipath(name)))
 
-    mob_files, mob_models = cyber_mobs.files(png_bytes)
-    files.update(mob_files)
-    for cmd, model in mob_models:                          # детали моделей мобов — предметы на основе светящегося мешочка
-        by_base.setdefault('glow_ink_sac', []).append((cmd, model))
+    for mobs in (cyber_mobs, realm_mobs):
+        mob_files, mob_models = mobs.files(png_bytes)
+        files.update(mob_files)
+        for cmd, model in mob_models:                      # детали моделей мобов — предметы на основе светящегося мешочка
+            by_base.setdefault('glow_ink_sac', []).append((cmd, model))
 
     for base_item, lst in by_base.items():
         # предикат custom_model_data срабатывает «от и выше», побеждает последний подходящий, поэтому — по возрастанию
         lst.sort()
-        model = {'parent': 'minecraft:item/generated', 'textures': {'layer0': 'minecraft:item/%s' % base_item},
+        model = {'parent': realm_pack.PARENT.get(base_item, 'minecraft:item/generated'), 'textures': {'layer0': 'minecraft:item/%s' % base_item},
                  'overrides': [{'predicate': {'custom_model_data': cmd}, 'model': path} for cmd, path in lst]}
         files['assets/minecraft/models/item/%s.json' % base_item] = json.dumps(model, indent=2).encode('utf-8')
 
@@ -670,19 +682,21 @@ def build(base, out, preview=None):
     if preview:
         os.makedirs(preview, exist_ok=True)
         names = list(ICONS)
-        scale = 10
-        sheet = Image.new('RGBA', (5 * 16 * scale + 6 * 8, 2 * 16 * scale + 3 * 8), (30, 32, 48, 255))
+        scale, cols = 8, 10
+        rowsn = (len(names) + cols - 1) // cols
+        sheet = Image.new('RGBA', (cols * 16 * scale + (cols + 1) * 8, rowsn * 16 * scale + (rowsn + 1) * 8), (30, 32, 48, 255))
         for k, name in enumerate(names):
             big = imgs[name].resize((16 * scale, 16 * scale), Image.NEAREST)
-            x = 8 + (k % 5) * (16 * scale + 8)
-            y = 8 + (k // 5) * (16 * scale + 8)
+            x = 8 + (k % cols) * (16 * scale + 8)
+            y = 8 + (k // cols) * (16 * scale + 8)
             sheet.alpha_composite(big, (x, y))
         sheet.save(os.path.join(preview, 'icons.png'))
         # настоящий размер в инвентаре (3×) для проверки читаемости
-        small = Image.new('RGBA', (10 * 16 * 3 + 11 * 4, 16 * 3 + 8), (60, 60, 70, 255))
+        small = Image.new('RGBA', (cols * 52 + 4, rowsn * 52 + 4), (60, 60, 70, 255))
         for k, name in enumerate(names):
-            small.alpha_composite(imgs[name].resize((48, 48), Image.NEAREST), (4 + k * 52, 4))
+            small.alpha_composite(imgs[name].resize((48, 48), Image.NEAREST), (4 + (k % cols) * 52, 4 + (k // cols) * 52))
         small.save(os.path.join(preview, 'icons_small.png'))
+        realm_mobs.preview(preview)
 
 
 if __name__ == '__main__':

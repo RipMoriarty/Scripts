@@ -409,11 +409,11 @@ def all_mobs():
 # Файлы пака
 # ----------------------------------------------------------------------------------------------
 
-def files(png_bytes):
+def files(png_bytes, mobs=None):
     """путь в архиве → байты; плюс список (имя части, CustomModelData, модель) для переопределений предмета."""
     out = {}
     models = []
-    for m in all_mobs():
+    for m in (mobs if mobs is not None else all_mobs()):
         out['assets/kniga/textures/cyber/mob/%s.png' % m.name] = png_bytes(m.sheet.image())
         for p in m.parts:
             name = '%s_%s' % (m.name, p.name)
