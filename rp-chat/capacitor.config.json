@@ -8,5 +8,11 @@
       "insetsHandling": "native",
       "style": "DARK"
     }
+  },
+  "server": {
+    "cleartext": true
+  },
+  "android": {
+    "allowMixedContent": true
   }
 }

@@ -83,6 +83,25 @@ def api_route(route):
     return route.fulfill(status=404, headers=CORS, body="{}")
 
 
+LOCAL = "http://192.168.0.100:11434/v1"
+state["local_requests"] = []
+state["local_mode"] = "ok"
+
+
+def local_route(route):
+    req = route.request
+    if req.method == "OPTIONS":
+        return route.fulfill(status=204, headers=CORS)
+    if state["local_mode"] == "down":
+        return route.abort()
+    if req.url.endswith("/models"):
+        return route.fulfill(status=200, headers={**CORS, "content-type": "application/json"}, body=json.dumps({"object": "list", "data": [{"id": "qwen2.5:7b"}, {"id": "llama3.1:8b"}]}))
+    if req.url.endswith("/chat/completions"):
+        state["local_requests"].append({"url": req.url, "headers": req.headers, "body": json.loads(req.post_data)})
+        return route.fulfill(status=200, headers={**CORS, "content-type": "text/event-stream"}, body=sse(["*Кивает.* ", "Локальный ответ."]))
+    return route.fulfill(status=404, headers=CORS, body="{}")
+
+
 problems = []
 passed = 0
 
@@ -109,6 +128,7 @@ with sync_playwright() as pw:
     page.on("pageerror", lambda e: errors.append(f"pageerror: {e}"))
     page.on("console", lambda m: errors.append(f"console.{m.type}: {m.text}") if m.type == "error" and "Failed to load resource" not in m.text else None)
     page.route(API + "/**", api_route)
+    page.route("http://192.168.0.100:11434/**", local_route)
 
     # ---- 1. главный экран ----
     page.goto(BASE)
@@ -134,11 +154,11 @@ with sync_playwright() as pw:
     page.locator(".chip", has_text="Настройки").click()
     page.wait_for_selector("text=Подключение к модели")
     page.fill("input[type=password]", "sk-or-bad")
-    page.click("text=Проверить ключ")
+    page.get_by_role("button", name="Проверить подключение").click()
     page.wait_for_selector(".status-bad")
     check("API-ключ" in page.locator(".status-bad").inner_text(), "неверный ключ → сообщение об ошибке")
     page.fill("input[type=password]", "sk-or-test")
-    page.click("text=Проверить ключ")
+    page.get_by_role("button", name="Проверить подключение").click()
     page.wait_for_selector(".status-ok")
     check("Ключ работает" in page.locator(".status-ok").inner_text(), "верный ключ принят")
     page.get_by_role("button", name="Найти бесплатные DeepSeek").click()
@@ -147,7 +167,7 @@ with sync_playwright() as pw:
     check(ids == ["deepseek/deepseek-v4-flash-0731:free", "deepseek/deepseek-r1:free"], f"найдены только бесплатные DeepSeek, новые первыми: {ids}")
     shot(page, "03_settings_models")
     page.locator(".pill", has_text="deepseek-r1").click()
-    check(page.input_value("input[placeholder='deepseek/…:free']") == "deepseek/deepseek-r1:free", "выбор модели записан в поле")
+    check(page.input_value("input[placeholder='Название модели']") == "deepseek/deepseek-r1:free", "выбор модели записан в поле")
     stored = page.evaluate("JSON.parse(localStorage.getItem('rpchat.v1')).settings")
     check(stored["apiKey"] == "sk-or-test" and stored["model"] == "deepseek/deepseek-r1:free", "настройки сохранены в localStorage")
     page.fill("input[placeholder='Как к вам обращаться']", "Алекс")
@@ -278,6 +298,56 @@ with sync_playwright() as pw:
     page.wait_for_function("document.querySelectorAll('.card').length === 3")
     check(page.locator(".banner").count() == 0, "после ввода ключа баннер скрыт")
     shot(page, "09_home_final")
+
+
+    # ---- 12b. свой сервер (Ollama) ----
+    page.click("button[aria-label='Настройки']")
+    page.wait_for_selector("text=Подключение к модели")
+    page.get_by_role("button", name="Ollama (ПК)").click()
+    check(page.input_value("input[type=url]") == LOCAL, "пресет Ollama подставляет адрес сервера")
+    check(page.locator("text=Как подключить свой сервер").first.is_visible() and not page.locator("text=Как получить бесплатный доступ").first.is_visible(), "показана инструкция для своего сервера вместо OpenRouter")
+    check(page.input_value("input[type=password]") == "" and page.input_value("input[placeholder='Название модели']") == "", "ключ и модель OpenRouter не переносятся на локальный сервер")
+    check(not page.get_by_role("button", name="Найти бесплатные DeepSeek").is_visible() and page.get_by_role("button", name="Показать модели сервера").is_visible(), "кнопки поиска подстроены под локальный сервер")
+    page.get_by_role("button", name="Проверить подключение").click()
+    page.wait_for_selector(".status-ok")
+    check("Моделей: 2" in page.locator(".status-ok").inner_text(), "проверка подключения к серверу без ключа")
+    page.get_by_role("button", name="Показать модели сервера").click()
+    page.wait_for_selector(".pill")
+    check([t.split("\n")[0] for t in page.locator(".pill").all_inner_texts()] == ["llama3.1:8b", "qwen2.5:7b"], "список моделей сервера получен")
+    shot(page, "10_settings_local")
+    page.locator(".pill", has_text="llama3.1").click()
+    extra = page.locator("textarea[placeholder^='{\"top_p']")
+    extra.fill("{oops")
+    check("Неверный JSON" in page.locator(".status-bad").inner_text(), "неверный JSON в доп. параметрах подсвечивается")
+    extra.fill('{"top_p": 0.9, "repeat_penalty": 1.15}')
+    page.go_back()
+    page.wait_for_selector(".card")
+    check(page.locator(".banner").count() == 0, "для своего сервера баннер «Нужен API-ключ» не показывается")
+    page.locator(".card", has_text="Мира").click()
+    page.wait_for_selector(".composer")
+    page.fill("textarea", "Привет, локальный сервер")
+    page.click(".send")
+    page.wait_for_function("[...document.querySelectorAll('.msg.bot')].some(e => e.innerText.includes('Локальный ответ.'))")
+    lr = state["local_requests"][-1]
+    check(lr["url"] == LOCAL + "/chat/completions" and lr["body"]["model"] == "llama3.1:8b", "запрос ушёл на локальный сервер с выбранной моделью")
+    check(lr["body"]["top_p"] == 0.9 and lr["body"]["repeat_penalty"] == 1.15, "дополнительные параметры JSON добавлены в запрос")
+    check("authorization" not in {k.lower() for k in lr["headers"]}, "ключ OpenRouter на локальный сервер не отправляется")
+    state["local_mode"] = "down"
+    page.fill("textarea", "Сервер выключен")
+    page.click(".send")
+    page.wait_for_selector(".msg.err")
+    check("Wi-Fi" in page.locator(".msg.err").inner_text() and page.locator(".msg.err .chip", has_text="Настройки").count() == 1, "сервер недоступен → подсказки и кнопка настроек")
+    shot(page, "11_local_down")
+    state["local_mode"] = "ok"
+    page.go_back()
+    page.wait_for_selector(".card")
+    page.click("button[aria-label='Настройки']")
+    page.get_by_role("button", name="OpenRouter", exact=True).click()
+    st = page.evaluate("window.__rp.db.settings")
+    check(st["apiKey"] == "sk-or-test" and st["model"] == "deepseek/deepseek-v4-flash-0731:free", "при возврате на OpenRouter ключ и модель восстановлены")
+    check(st["extraBody"] == '{"top_p": 0.9, "repeat_penalty": 1.15}', "дополнительные параметры сохранены")
+    page.go_back()
+    page.wait_for_selector(".card")
 
     page.reload()
     page.wait_for_selector(".card")

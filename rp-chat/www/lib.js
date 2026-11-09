@@ -10,7 +10,65 @@ export const DEFAULT_SETTINGS = {
   stream: true,
   userName: 'Я',
   userPersona: '',
+  extraBody: '',
+  profiles: {}, // запомненные модель и ключ для каждого типа сервера
 };
+
+/* ---------- серверы ---------- */
+
+export const PRESETS = [
+  { id: 'openrouter', label: 'OpenRouter', url: 'https://openrouter.ai/api/v1' },
+  { id: 'ollama', label: 'Ollama (ПК)', url: 'http://192.168.0.100:11434/v1' },
+  { id: 'lmstudio', label: 'LM Studio (ПК)', url: 'http://192.168.0.100:1234/v1' },
+  { id: 'kobold', label: 'KoboldCpp (ПК)', url: 'http://192.168.0.100:5001/v1' },
+  { id: 'phone', label: 'Этот телефон', url: 'http://127.0.0.1:11434/v1' },
+];
+
+export const isOpenRouterUrl = (u) => /openrouter\.ai/i.test(String(u || ''));
+
+/** 'openrouter' | 'deepseek' (официальный платный API) | 'local' (свой сервер, ключ не нужен) */
+export function serverClass(u) {
+  if (isOpenRouterUrl(u)) return 'openrouter';
+  if (/(^|\/\/|\.)deepseek\.com/i.test(String(u || ''))) return 'deepseek';
+  return 'local';
+}
+
+export const needsApiKey = (u) => serverClass(u) !== 'local';
+
+export function presetIdForUrl(u) {
+  const s = String(u || '').trim();
+  if (isOpenRouterUrl(s)) return 'openrouter';
+  let host = '';
+  let port = '';
+  try {
+    const p = new URL(s);
+    host = p.hostname;
+    port = p.port;
+  } catch {
+    return 'custom';
+  }
+  if (host === '127.0.0.1' || host === 'localhost' || host === '[::1]' || host === '::1') return 'phone';
+  return { 11434: 'ollama', 1234: 'lmstudio', 5001: 'kobold' }[port] || 'custom';
+}
+
+export function defaultProfile(cls) {
+  if (cls === 'openrouter') return { model: DEFAULT_SETTINGS.model, apiKey: '' };
+  if (cls === 'deepseek') return { model: 'deepseek-chat', apiKey: '' };
+  return { model: '', apiKey: '' };
+}
+
+/** Дополнительные поля запроса, например {"top_p":0.95,"repeat_penalty":1.1}. */
+export function parseExtraBody(text) {
+  const t = String(text ?? '').trim();
+  if (!t) return { ok: true, value: {} };
+  try {
+    const v = JSON.parse(t);
+    if (!v || typeof v !== 'object' || Array.isArray(v)) return { ok: false, error: 'Нужен JSON-объект, например {"top_p": 0.95}.' };
+    return { ok: true, value: v };
+  } catch (e) {
+    return { ok: false, error: 'Неверный JSON: ' + e.message };
+  }
+}
 
 export const EMPTY_CHARACTER = {
   name: '',
@@ -162,7 +220,7 @@ export function describeError(status, bodyText) {
     text = 'Лимит запросов исчерпан (у бесплатных моделей: 20 в минуту и 50 в день без пополнения). Подождите или смените модель.';
   } else if (st === 404 || /no endpoints found|not a valid model|model.{0,20}not found|no allowed providers/i.test(raw)) {
     kind = 'model';
-    text = 'Эта модель недоступна (возможно, бесплатный вариант убрали).';
+    text = 'Модель не найдена. Проверьте название в настройках или выберите её из списка. У OpenRouter бесплатные модели периодически убирают.';
   } else if (st >= 500) {
     kind = 'server';
     text = 'Сервер модели временно недоступен. Попробуйте ещё раз.';
@@ -189,6 +247,15 @@ export function listFreeModels(json, filter = 'deepseek') {
     })
     .sort((a, b) => (b.created || 0) - (a.created || 0))
     .map((m) => ({ id: m.id, name: m.name || m.id, context: m.context_length || 0 }));
+}
+
+/** Все модели сервера (для Ollama, LM Studio и т.п., где цен нет). */
+export function listAllModels(json) {
+  const arr = Array.isArray(json?.data) ? json.data : Array.isArray(json?.models) ? json.models : [];
+  return arr
+    .map((m) => ({ id: String(m?.id ?? m?.name ?? m?.model ?? ''), name: String(m?.name ?? m?.id ?? ''), context: m?.context_length || 0 }))
+    .filter((m) => m.id)
+    .sort((a, b) => a.id.localeCompare(b.id));
 }
 
 /* ---------- импорт персонажей ---------- */

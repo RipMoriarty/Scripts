@@ -169,4 +169,39 @@ test('chatToText использует имена', () => {
   assert.equal(t, 'Мира: Привет\n\nАлекс: Здравствуй');
 });
 
+test('серверы: класс, пресет, необходимость ключа', () => {
+  assert.equal(L.serverClass('https://openrouter.ai/api/v1'), 'openrouter');
+  assert.equal(L.serverClass('https://api.deepseek.com'), 'deepseek');
+  assert.equal(L.serverClass('http://192.168.0.100:11434/v1'), 'local');
+  assert.equal(L.needsApiKey('https://openrouter.ai/api/v1'), true);
+  assert.equal(L.needsApiKey('http://192.168.0.100:1234/v1'), false);
+  assert.equal(L.presetIdForUrl('http://10.0.0.5:11434/v1'), 'ollama');
+  assert.equal(L.presetIdForUrl('http://10.0.0.5:1234/v1'), 'lmstudio');
+  assert.equal(L.presetIdForUrl('http://10.0.0.5:5001/v1'), 'kobold');
+  assert.equal(L.presetIdForUrl('http://127.0.0.1:8080/v1'), 'phone');
+  assert.equal(L.presetIdForUrl('http://localhost:11434/v1'), 'phone');
+  assert.equal(L.presetIdForUrl('http://10.0.0.5:9999/v1'), 'custom');
+  assert.equal(L.presetIdForUrl('мусор'), 'custom');
+  for (const pr of L.PRESETS) assert.equal(L.presetIdForUrl(pr.url), pr.id, pr.id);
+  assert.deepEqual(L.defaultProfile('local'), { model: '', apiKey: '' });
+  assert.equal(L.defaultProfile('openrouter').model, L.DEFAULT_SETTINGS.model);
+});
+
+test('parseExtraBody', () => {
+  assert.deepEqual(L.parseExtraBody(''), { ok: true, value: {} });
+  assert.deepEqual(L.parseExtraBody('{"top_p":0.9}'), { ok: true, value: { top_p: 0.9 } });
+  assert.equal(L.parseExtraBody('[1]').ok, false);
+  assert.equal(L.parseExtraBody('null').ok, false);
+  const bad = L.parseExtraBody('{oops');
+  assert.equal(bad.ok, false);
+  assert.match(bad.error, /Неверный JSON/);
+});
+
+test('listAllModels: Ollama / LM Studio / Kobold', () => {
+  const ollama = { object: 'list', data: [{ id: 'qwen2.5:7b' }, { id: 'llama3.1:8b' }] };
+  assert.deepEqual(L.listAllModels(ollama).map((m) => m.id), ['llama3.1:8b', 'qwen2.5:7b']);
+  assert.deepEqual(L.listAllModels({ models: [{ name: 'x' }] }).map((m) => m.id), ['x']);
+  assert.deepEqual(L.listAllModels(null), []);
+});
+
 console.log(`\nunit: ${passed} passed`);

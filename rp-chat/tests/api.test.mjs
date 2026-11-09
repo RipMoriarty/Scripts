@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { chatCompletion, fetchModels, checkKey, ApiError } from '../www/api.js';
+import { chatCompletion, fetchModels, checkConnection, ApiError } from '../www/api.js';
 
 let passed = 0;
 const test = async (name, fn) => {
@@ -152,10 +152,40 @@ await test('конфиг: нет модели / нет адреса', async () =
 await test('fetchModels и checkKey', async () => {
   const j = await fetchModels(S('x'));
   assert.equal(j.data[0].id, 'deepseek/x:free');
-  // base не openrouter → /models; проверим, что /key вызывается только для openrouter, поэтому тут — просто /models
-  const info = await checkKey(S('x'));
-  assert.deepEqual(info, {});
-  await assert.rejects(checkKey({ ...S('x'), apiKey: '' }), (e) => e.kind === 'auth');
+  // адрес не OpenRouter → проверка идёт через /models и ключ необязателен
+  assert.deepEqual(await checkConnection(S('x')), { kind: 'server', count: 1 });
+  assert.deepEqual(await checkConnection(S('x', { apiKey: '' })), { kind: 'server', count: 1 });
+  await assert.rejects(checkConnection({ ...S('x'), baseUrl: '' }), (e) => e.kind === 'config');
+});
+
+await test('без ключа заголовок Authorization не отправляется (локальный сервер)', async () => {
+  await chatCompletion({ settings: S('json', { apiKey: '', stream: false }), messages: MSGS });
+  assert.equal(globalThis.__lastAuth, undefined);
+});
+
+await test('дополнительные параметры JSON добавляются в запрос, но не перекрывают основные поля', async () => {
+  await chatCompletion({
+    settings: S('json', { stream: false, extraBody: '{"top_p":0.9,"repeat_penalty":1.15,"model":"hack","temperature":5}' }),
+    messages: MSGS,
+  });
+  const b = globalThis.__lastBody;
+  assert.equal(b.top_p, 0.9);
+  assert.equal(b.repeat_penalty, 1.15);
+  assert.equal(b.model, 'json');
+  assert.equal(b.temperature, 0.7);
+});
+
+await test('неверный JSON в дополнительных параметрах → понятная ошибка до запроса', async () => {
+  globalThis.__lastBody = null;
+  await assert.rejects(chatCompletion({ settings: S('json', { extraBody: '{oops' }), messages: MSGS }), (e) => e.kind === 'config' && /Дополнительные параметры/.test(e.message));
+  assert.equal(globalThis.__lastBody, null);
+});
+
+await test('для http-сервера ошибка соединения содержит подсказки про Wi-Fi и CORS', async () => {
+  await assert.rejects(
+    chatCompletion({ settings: { ...S('x'), baseUrl: 'http://127.0.0.1:1/v1' }, messages: MSGS }),
+    (e) => e.kind === 'network' && /Wi-Fi/.test(e.message) && /CORS/.test(e.message),
+  );
 });
 
 server.close();

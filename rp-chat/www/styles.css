@@ -239,3 +239,9 @@ button { cursor: pointer; border: 0; background: none; }
   background: #2b3045; border: 1px solid var(--border); padding: 10px 16px; border-radius: 14px;
   max-width: 90%; box-shadow: 0 6px 24px rgba(0, 0, 0, 0.4); font-size: 15px; animation: up 0.18s ease-out;
 }
+
+[hidden] { display: none !important; }
+.chips { display: flex; flex-wrap: wrap; gap: 8px; }
+.chips .chip { padding: 9px 14px; }
+.chip.sel { border-color: var(--accent); background: #232049; color: #fff; }
+.pill-list { max-height: 340px; overflow-y: auto; }

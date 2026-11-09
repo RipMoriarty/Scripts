@@ -1,5 +1,5 @@
 // api.js — запросы к OpenAI-совместимому API (OpenRouter, DeepSeek и т.п.)
-import { describeError } from './lib.js';
+import { describeError, isOpenRouterUrl, parseExtraBody } from './lib.js';
 
 export class ApiError extends Error {
   constructor(kind, message, status = 0) {
@@ -11,7 +11,7 @@ export class ApiError extends Error {
 }
 
 const trimBase = (u) => String(u || '').trim().replace(/\/+$/, '');
-const isOpenRouter = (base) => /openrouter\.ai/i.test(base);
+const isOpenRouter = isOpenRouterUrl;
 
 function authHeaders(settings) {
   const key = String(settings.apiKey || '').trim();
@@ -24,7 +24,13 @@ async function errorFromResponse(res) {
   return new ApiError(d.kind, d.message, res.status);
 }
 
-function networkError() {
+function networkError(base = '') {
+  if (/^http:\/\//i.test(String(base))) {
+    return new ApiError(
+      'network',
+      'Не удалось подключиться к серверу. Проверьте: сервер запущен; телефон и ПК в одной Wi-Fi сети; адрес и порт верны; сервер слушает все адреса (0.0.0.0), а не только 127.0.0.1; в сервере разрешён CORS.',
+    );
+  }
   return new ApiError('network', 'Нет соединения с сервером. Проверьте интернет и адрес API в настройках.');
 }
 
@@ -37,7 +43,11 @@ export async function chatCompletion({ settings, messages, signal, onDelta }) {
   if (!base) throw new ApiError('config', 'Не указан адрес API (Base URL) в настройках.');
   if (!String(settings.model || '').trim()) throw new ApiError('config', 'Не выбрана модель. Откройте настройки и выберите её.');
 
+  const extra = parseExtraBody(settings.extraBody);
+  if (!extra.ok) throw new ApiError('config', 'Дополнительные параметры в настройках: ' + extra.error);
+
   const body = {
+    ...extra.value,
     model: String(settings.model).trim(),
     messages,
     temperature: Number(settings.temperature),
@@ -55,7 +65,7 @@ export async function chatCompletion({ settings, messages, signal, onDelta }) {
     });
   } catch (e) {
     if (e?.name === 'AbortError') throw e;
-    throw networkError();
+    throw networkError(base);
   }
   if (!res.ok) throw await errorFromResponse(res);
 
@@ -66,7 +76,7 @@ export async function chatCompletion({ settings, messages, signal, onDelta }) {
       j = await res.json();
     } catch (e) {
       if (e?.name === 'AbortError') throw e;
-      throw networkError();
+      throw networkError(base);
     }
     if (j?.error) {
       const d = describeError(j.error.code || 500, JSON.stringify(j));
@@ -131,7 +141,7 @@ export async function chatCompletion({ settings, messages, signal, onDelta }) {
       // соединение оборвалось, но часть ответа уже есть
       return { text, finish: 'interrupted' };
     }
-    throw networkError();
+    throw networkError(base);
   }
   return { text, finish };
 }
@@ -145,25 +155,30 @@ export async function fetchModels(settings, signal) {
     res = await fetch(`${base}/models`, { headers: isOpenRouter(base) ? {} : authHeaders(settings), signal });
   } catch (e) {
     if (e?.name === 'AbortError') throw e;
-    throw networkError();
+    throw networkError(base);
   }
   if (!res.ok) throw await errorFromResponse(res);
   return res.json();
 }
 
-/** Проверка ключа без расхода лимита запросов к моделям. */
-export async function checkKey(settings) {
+/**
+ * Проверка подключения без расхода лимита запросов к моделям.
+ * OpenRouter: проверяет ключ (GET /key). Другие серверы: GET /models, ключ необязателен.
+ */
+export async function checkConnection(settings) {
   const base = trimBase(settings.baseUrl);
   if (!base) throw new ApiError('config', 'Не указан адрес API (Base URL).');
-  if (!String(settings.apiKey || '').trim()) throw new ApiError('auth', 'Ключ не введён.');
-  const url = isOpenRouter(base) ? `${base}/key` : `${base}/models`;
+  const orouter = isOpenRouter(base);
+  if (orouter && !String(settings.apiKey || '').trim()) throw new ApiError('auth', 'Ключ не введён.');
   let res;
   try {
-    res = await fetch(url, { headers: authHeaders(settings) });
+    res = await fetch(orouter ? `${base}/key` : `${base}/models`, { headers: authHeaders(settings) });
   } catch {
-    throw networkError();
+    throw networkError(base);
   }
   if (!res.ok) throw await errorFromResponse(res);
   const j = await res.json().catch(() => ({}));
-  return j?.data && !Array.isArray(j.data) ? j.data : {};
+  if (orouter) return { kind: 'openrouter', ...(j?.data && !Array.isArray(j.data) ? j.data : {}) };
+  const list = Array.isArray(j?.data) ? j.data : Array.isArray(j?.models) ? j.models : [];
+  return { kind: 'server', count: list.length };
 }

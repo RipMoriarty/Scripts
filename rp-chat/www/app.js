@@ -1,5 +1,5 @@
 import * as L from './lib.js';
-import { chatCompletion, fetchModels, checkKey, ApiError } from './api.js';
+import { chatCompletion, fetchModels, checkConnection, ApiError } from './api.js';
 
 const STORAGE_KEY = 'rpchat.v1';
 const $app = document.getElementById('app');
@@ -65,6 +65,7 @@ function h(tag, props, ...children) {
 }
 
 function toast(msg, ms = 3200) {
+  while ($toasts.children.length >= 2) $toasts.firstChild.remove();
   const t = h('div', { class: 'toast' }, msg);
   $toasts.append(t);
   setTimeout(() => t.remove(), ms);
@@ -248,13 +249,13 @@ function lastSnippet(ch) {
 function viewHome() {
   const list = h('div', { class: 'scroll pad-bottom' });
 
-  if (!db.settings.apiKey.trim()) {
+  if (L.needsApiKey(db.settings.baseUrl) && !db.settings.apiKey.trim()) {
     list.append(
       h(
         'div',
         { class: 'banner' },
         h('b', {}, 'Нужен API-ключ'),
-        h('p', {}, 'Чтобы персонажи отвечали, добавьте бесплатный ключ OpenRouter — это займёт минуту.'),
+        h('p', {}, 'Чтобы персонажи отвечали, добавьте бесплатный ключ OpenRouter или подключите свой сервер (Ollama, LM Studio) в настройках.'),
         h('button', { class: 'btn primary', onclick: () => go('/settings') }, 'Открыть настройки'),
       ),
     );
@@ -574,7 +575,7 @@ function buildRows(id) {
     const e = chatErrors[id];
     const retry = h('div', { class: 'actions', style: 'margin-left:0;margin-top:10px' },
       h('button', { class: 'chip', onclick: () => { delete chatErrors[id]; runGeneration(id); } }, '↻ Повторить'),
-      ['auth', 'model', 'config'].includes(e.kind) && h('button', { class: 'chip', onclick: () => go('/settings') }, '⚙️ Настройки'),
+      ['auth', 'model', 'config', 'network'].includes(e.kind) && h('button', { class: 'chip', onclick: () => go('/settings') }, '⚙️ Настройки'),
     );
     rows.push(h('div', { class: 'row bot' }, avatarEl(ch, 'sm'), h('div', { class: 'msg bot err' }, h('div', { style: 'white-space:pre-wrap' }, '⚠️ ' + e.message), retry)));
   } else {
@@ -614,6 +615,7 @@ function regenerate(id) {
 }
 
 async function autoPickModel() {
+  if (!L.isOpenRouterUrl(db.settings.baseUrl)) return null;
   try {
     const json = await fetchModels(db.settings);
     const list = L.listFreeModels(json, 'deepseek').filter((m) => m.id !== db.settings.model);
@@ -632,8 +634,8 @@ async function runGeneration(id, { continueLast = false } = {}) {
   const chat = db.chats[id];
   if (!ch || !chat) return;
   const s = db.settings;
-  if (!s.apiKey.trim() && /openrouter|deepseek/i.test(s.baseUrl)) {
-    chatErrors[id] = { kind: 'auth', message: 'Не указан API-ключ. Откройте настройки и вставьте ключ OpenRouter.' };
+  if (L.needsApiKey(s.baseUrl) && !s.apiKey.trim()) {
+    chatErrors[id] = { kind: 'auth', message: 'Не указан API-ключ. Откройте настройки и вставьте ключ или выберите свой сервер.' };
     refreshChat(true);
     return;
   }
@@ -747,26 +749,88 @@ function chatMenu(ch) {
    ===================================================================== */
 function viewSettings() {
   const s = db.settings;
+  if (!s.profiles || typeof s.profiles !== 'object') s.profiles = {};
   const put = (key, val) => { s[key] = val; save(); };
 
   const textInput = (key, props = {}) => {
-    const el = h('input', { type: 'text', value: s[key] ?? '', autocapitalize: 'off', autocomplete: 'off', spellcheck: false, ...props });
+    const el = h('input', { type: 'text', value: s[key] ?? '', autocapitalize: 'off', autocomplete: 'off', ...props });
     el.addEventListener('input', () => put(key, el.value));
     return el;
   };
 
+  const urlInput = textInput('baseUrl', { type: 'url', placeholder: 'https://openrouter.ai/api/v1' });
   const keyInput = textInput('apiKey', { type: 'password', placeholder: 'sk-or-v1-…' });
   const eye = h('button', { class: 'btn', 'aria-label': 'Показать ключ', onclick: () => { keyInput.type = keyInput.type === 'password' ? 'text' : 'password'; } }, '👁');
-  const modelInput = textInput('model', { placeholder: 'deepseek/…:free' });
+  const modelInput = textInput('model', { placeholder: 'Название модели' });
+  const keyLabel = h('label', {}, 'API-ключ');
+  const keyHint = h('div', { class: 'hint' });
   const keyStatus = h('div', { class: 'hint' });
   const modelStatus = h('div', { class: 'hint' });
   const modelList = h('div', { class: 'pill-list' });
+  const urlHint = h('div', { class: 'hint' });
 
-  const showModels = (models) => {
+  /* ---- выбор сервера ---- */
+  let lastBase = s.baseUrl;
+  const chips = L.PRESETS.map((p) => {
+    const el = h('button', { class: 'chip', onclick: () => choosePreset(p) }, p.label);
+    el.dataset.id = p.id;
+    return el;
+  });
+
+  function applyServerChange(oldUrl, newUrl, clearModel = false) {
+    const oldCls = L.serverClass(oldUrl);
+    const newCls = L.serverClass(newUrl);
+    if (oldCls !== newCls) {
+      s.profiles[oldCls] = { model: s.model, apiKey: s.apiKey };
+      const prof = s.profiles[newCls] || L.defaultProfile(newCls);
+      s.model = prof.model;
+      s.apiKey = prof.apiKey;
+    } else if (clearModel) {
+      s.model = '';
+    }
+    s.baseUrl = newUrl;
+    lastBase = newUrl;
+    save();
+    urlInput.value = s.baseUrl;
+    keyInput.value = s.apiKey;
+    modelInput.value = s.model;
+    modelList.replaceChildren();
+    modelStatus.textContent = '';
+    keyStatus.textContent = '';
+    refreshServerUI();
+  }
+
+  function choosePreset(p) {
+    if (L.presetIdForUrl(s.baseUrl) === p.id) return; // уже выбран — адрес не трогаем
+    applyServerChange(s.baseUrl, p.url, true);
+  }
+
+  urlInput.addEventListener('change', () => applyServerChange(lastBase, urlInput.value.trim()));
+
+  const orBox = h('div', { class: 'banner' },
+    h('b', {}, 'Как получить бесплатный доступ к DeepSeek'),
+    h('ol', { class: 'steps' },
+      h('li', { html: 'Зарегистрируйтесь на <a href="https://openrouter.ai">openrouter.ai</a> (можно через Google или GitHub).' }),
+      h('li', { html: 'Откройте <a href="https://openrouter.ai/keys">openrouter.ai/keys</a> → Create Key и скопируйте ключ.' }),
+      h('li', {}, 'Вставьте ключ ниже и нажмите «Найти бесплатные DeepSeek».'),
+    ),
+  );
+  const localBox = h('div', { class: 'banner' },
+    h('b', {}, 'Как подключить свой сервер'),
+    h('ol', { class: 'steps' },
+      h('li', {}, 'На ПК установите Ollama или LM Studio и скачайте модель.'),
+      h('li', {}, 'Откройте доступ по сети. Ollama: переменные OLLAMA_HOST=0.0.0.0 и OLLAMA_ORIGINS=*, затем перезапуск. LM Studio: Developer → Server Settings → «Serve on Local Network» и «Enable CORS».'),
+      h('li', {}, 'Узнайте IP ПК (в Windows — команда ipconfig) и впишите его в адрес ниже. ПК и телефон должны быть в одной Wi-Fi сети.'),
+      h('li', {}, 'Нажмите «Проверить подключение», затем «Показать модели сервера» и выберите модель.'),
+    ),
+    h('div', { class: 'hint', style: 'margin-top:8px' }, 'Если сервер запущен на самом телефоне (например, в Termux), выберите «Этот телефон».'),
+  );
+
+  const showModels = (models, limit = 12) => {
     modelList.replaceChildren(
-      ...models.slice(0, 12).map((m) =>
-        h('button', { class: 'pill' + (m.id === s.model ? ' sel' : ''), onclick: () => { put('model', m.id); modelInput.value = m.id; showModels(models); } },
-          m.id, h('small', {}, m.name + (m.context ? ` · контекст ${Math.round(m.context / 1000)}k` : ''))),
+      ...models.slice(0, limit).map((m) =>
+        h('button', { class: 'pill' + (m.id === s.model ? ' sel' : ''), onclick: () => { put('model', m.id); modelInput.value = m.id; showModels(models, limit); } },
+          m.id, (m.name && m.name !== m.id) || m.context ? h('small', {}, [m.name !== m.id ? m.name : '', m.context ? `контекст ${Math.round(m.context / 1000)}k` : ''].filter(Boolean).join(' · ')) : null),
       ),
     );
   };
@@ -791,20 +855,66 @@ function viewSettings() {
     }
   }
 
-  async function testKey() {
+  async function listServerModels() {
+    modelStatus.className = 'hint';
+    modelStatus.textContent = 'Запрашиваю список…';
+    modelList.replaceChildren();
+    try {
+      const models = L.listAllModels(await fetchModels(s));
+      if (!models.length) {
+        modelStatus.textContent = 'Сервер ответил, но моделей нет. Скачайте или загрузите модель на сервере и повторите.';
+        return;
+      }
+      modelStatus.textContent = `Моделей на сервере: ${models.length}. Нажмите на нужную.`;
+      showModels(models, 40);
+    } catch (e) {
+      modelStatus.className = 'hint status-bad';
+      modelStatus.textContent = e.message || String(e);
+    }
+  }
+
+  async function testConnection() {
     keyStatus.className = 'hint';
     keyStatus.textContent = 'Проверяю…';
     try {
-      const info = await checkKey(s);
+      const info = await checkConnection(s);
       keyStatus.className = 'hint status-ok';
-      const extra = info.is_free_tier === true ? ' Тариф: бесплатный (лимиты free-моделей: 50 запросов в день).' : '';
-      keyStatus.textContent = '✓ Ключ работает.' + extra;
+      if (info.kind === 'openrouter') {
+        keyStatus.textContent = '✓ Ключ работает.' + (info.is_free_tier === true ? ' Тариф: бесплатный (лимиты free-моделей: 50 запросов в день).' : '');
+      } else {
+        keyStatus.textContent = `✓ Сервер отвечает. Моделей: ${info.count}.` + (info.count === 0 ? ' Загрузите модель на сервере.' : '');
+      }
     } catch (e) {
       keyStatus.className = 'hint status-bad';
       keyStatus.textContent = e.message || String(e);
     }
   }
 
+  const findBtn = h('button', { class: 'btn grow', onclick: () => findModels('deepseek') }, 'Найти бесплатные DeepSeek');
+  const allFreeBtn = h('button', { class: 'btn', onclick: () => findModels('') }, 'Все бесплатные');
+  const listBtn = h('button', { class: 'btn grow', onclick: listServerModels }, 'Показать модели сервера');
+  const modelHint = h('div', { class: 'hint' });
+
+  function refreshServerUI() {
+    const cls = L.serverClass(s.baseUrl);
+    const preset = L.presetIdForUrl(s.baseUrl);
+    for (const c of chips) c.classList.toggle('sel', c.dataset.id === preset);
+    orBox.hidden = cls !== 'openrouter';
+    localBox.hidden = cls !== 'local';
+    findBtn.hidden = allFreeBtn.hidden = cls !== 'openrouter';
+    listBtn.hidden = cls === 'openrouter';
+    keyLabel.textContent = L.needsApiKey(s.baseUrl) ? 'API-ключ' : 'API-ключ (необязательно)';
+    keyInput.placeholder = L.needsApiKey(s.baseUrl) ? 'sk-or-v1-…' : 'не нужен';
+    keyHint.textContent = L.needsApiKey(s.baseUrl)
+      ? 'Хранится только на этом телефоне.'
+      : 'Для локального сервера обычно не нужен. Оставьте пустым.';
+    urlHint.textContent = cls === 'local' ? 'Замените IP на адрес вашего ПК (и порт, если менялся). Адрес должен начинаться с http:// и заканчиваться на /v1.' : '';
+    modelHint.textContent = cls === 'openrouter'
+      ? 'Бесплатные модели у OpenRouter имеют суффикс :free и со временем меняются — используйте поиск ниже.'
+      : 'Название модели должно совпадать с тем, что видит сервер (например, llama3.1:8b).';
+  }
+
+  /* ---- генерация ---- */
   const temp = h('input', { type: 'range', min: 0, max: 2, step: 0.05, value: s.temperature });
   const tempLabel = h('label', {}, `Температура: ${Number(s.temperature).toFixed(2)}`);
   temp.addEventListener('input', () => { put('temperature', Number(temp.value)); tempLabel.textContent = `Температура: ${Number(temp.value).toFixed(2)}`; });
@@ -822,6 +932,15 @@ function viewSettings() {
   const streamBox = h('input', { type: 'checkbox', checked: !!s.stream });
   streamBox.addEventListener('change', () => put('stream', streamBox.checked));
 
+  const extraStatus = h('div', { class: 'hint' }, 'Необязательно. Эти поля добавляются к каждому запросу (например, top_p, repeat_penalty, min_p).');
+  const extraTa = h('textarea', { value: s.extraBody || '', placeholder: '{"top_p": 0.95, "repeat_penalty": 1.1}', style: 'min-height:70px;font-family:monospace;font-size:14px' });
+  extraTa.addEventListener('input', () => {
+    put('extraBody', extraTa.value);
+    const r = L.parseExtraBody(extraTa.value);
+    extraStatus.className = 'hint' + (r.ok ? '' : ' status-bad');
+    extraStatus.textContent = r.ok ? 'Необязательно. Эти поля добавляются к каждому запросу (например, top_p, repeat_penalty, min_p).' : r.error;
+  });
+
   const personaTa = h('textarea', { value: s.userPersona || '', placeholder: 'Кто вы в игре: внешность, характер, история (необязательно)' });
   personaTa.addEventListener('input', () => put('userPersona', personaTa.value));
 
@@ -829,31 +948,24 @@ function viewSettings() {
     'div',
     { class: 'scroll form' },
     h('div', { class: 'section-title' }, 'Подключение к модели'),
-    h('div', { class: 'banner' },
-      h('b', {}, 'Как получить бесплатный доступ к DeepSeek'),
-      h('ol', { class: 'steps' },
-        h('li', { html: 'Зарегистрируйтесь на <a href="https://openrouter.ai">openrouter.ai</a> (можно через Google или GitHub).' }),
-        h('li', { html: 'Откройте <a href="https://openrouter.ai/keys">openrouter.ai/keys</a> → Create Key и скопируйте ключ.' }),
-        h('li', {}, 'Вставьте ключ ниже и нажмите «Найти бесплатные DeepSeek».'),
-      ),
-    ),
-    field('API-ключ', h('div', { class: 'inline' }, keyInput, eye), 'Хранится только на этом телефоне.'),
-    h('button', { class: 'btn block', onclick: testKey }, 'Проверить ключ'),
+    h('div', { class: 'chips' }, chips),
+    orBox,
+    localBox,
+    h('div', { class: 'field' }, h('label', {}, 'Адрес API (Base URL)'), urlInput, urlHint),
+    h('div', { class: 'field' }, keyLabel, h('div', { class: 'inline' }, keyInput, eye), keyHint),
+    h('button', { class: 'btn block', onclick: testConnection }, 'Проверить подключение'),
     keyStatus,
-    field('Модель', modelInput, 'Бесплатные модели у OpenRouter имеют суффикс :free и со временем меняются — используйте поиск ниже.'),
-    h('div', { class: 'inline' },
-      h('button', { class: 'btn grow', onclick: () => findModels('deepseek') }, 'Найти бесплатные DeepSeek'),
-      h('button', { class: 'btn', onclick: () => findModels('') }, 'Все бесплатные'),
-    ),
+    h('div', { class: 'field' }, h('label', {}, 'Модель'), modelInput, modelHint),
+    h('div', { class: 'inline' }, findBtn, allFreeBtn, listBtn),
     modelStatus,
     modelList,
-    field('Адрес API (Base URL)', textInput('baseUrl', { type: 'url', placeholder: 'https://openrouter.ai/api/v1' }), 'Подойдёт любой OpenAI-совместимый API, например https://api.deepseek.com (платный).'),
 
     h('div', { class: 'section-title' }, 'Генерация'),
     h('div', { class: 'field' }, tempLabel, temp, h('div', { class: 'hint' }, 'Выше — креативнее, ниже — предсказуемее. Для РП обычно 0.8–1.1.')),
     field('Макс. длина ответа (токенов)', numInput('maxTokens', 100, 8000, 50), 'Если ответы пустые или обрываются — увеличьте.'),
-    field('Сколько последних сообщений помнить', numInput('contextMessages', 4, 200)),
+    field('Сколько последних сообщений помнить', numInput('contextMessages', 4, 200), 'Для небольших локальных моделей поставьте 8–16: у них короткая память, лишнее обрезается.'),
     h('label', { class: 'check' }, streamBox, 'Показывать ответ по мере набора'),
+    h('div', { class: 'field' }, h('label', {}, 'Дополнительные параметры (JSON)'), extraTa, extraStatus),
 
     h('div', { class: 'section-title' }, 'Вы в игре'),
     field('Ваше имя', textInput('userName', { placeholder: 'Как к вам обращаться', maxLength: 40 })),
@@ -865,6 +977,7 @@ function viewSettings() {
     h('button', { class: 'btn block danger', onclick: resetAll }, '🗑 Удалить все данные'),
     h('div', { class: 'hint', style: 'text-align:center;margin-top:8px' }, 'РП Чат · данные хранятся на устройстве'),
   );
+  refreshServerUI();
 
   const bar = h('div', { class: 'bar' }, h('button', { class: 'icon-btn', 'aria-label': 'Назад', onclick: () => back() }, '←'), h('h1', {}, 'Настройки'));
   return [bar, form];

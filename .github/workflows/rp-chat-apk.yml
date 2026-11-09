@@ -46,6 +46,25 @@ jobs:
             cp -rv resources/android/res/. android/app/src/main/res/
           fi
 
+      - name: Allow HTTP to local servers (Ollama, LM Studio)
+        run: |
+          MANIFEST=android/app/src/main/AndroidManifest.xml
+          if ! grep -q 'usesCleartextTraffic' "$MANIFEST"; then
+            sed -i '0,/<application/s//<application\n        android:usesCleartextTraffic="true"/' "$MANIFEST"
+          fi
+          grep -n 'usesCleartextTraffic' "$MANIFEST"
+
+      - name: Use fixed debug signing key (so updates install over old versions)
+        run: |
+          mkdir -p ~/.android
+          cp resources/debug.keystore ~/.android/debug.keystore
+
+      - name: Set version from run number
+        run: |
+          GRADLE=android/app/build.gradle
+          sed -i -E 's/versionCode[ =]+[0-9]+/versionCode ${{ github.run_number }}/; s/versionName "[^"]*"/versionName "1.${{ github.run_number }}"/' "$GRADLE"
+          grep -nE 'versionCode|versionName' "$GRADLE" || echo "version fields not found"
+
       - name: Sync web assets
         run: npx cap sync android
 
@@ -73,4 +92,4 @@ jobs:
           TAG="rp-chat-build-${{ github.run_number }}"
           gh release create "$TAG" dist/RP-Chat.apk \
             --title "РП Чат — сборка #${{ github.run_number }}" \
-            --notes "Установочный файл для Android: RP-Chat.apk (подпись debug, для установки вручную)."
+            --notes "Установочный файл для Android: RP-Chat.apk (подпись debug, для установки вручную). Если Android не даёт обновить поверх старой версии, один раз удалите её (сначала сделайте резервную копию в Настройках)."
