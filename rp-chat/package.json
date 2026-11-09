@@ -1,0 +1,19 @@
+{
+  "name": "rp-chat",
+  "version": "1.0.0",
+  "private": true,
+  "description": "РП Чат — приложение для ролевых диалогов с ИИ-персонажами (DeepSeek через OpenRouter)",
+  "type": "module",
+  "scripts": {
+    "test": "node tests/unit.test.mjs && node tests/api.test.mjs",
+    "sync": "cap sync android"
+  },
+  "dependencies": {
+    "@capacitor/android": "^8.6.0",
+    "@capacitor/core": "^8.6.0",
+    "@capacitor/share": "^8.0.3"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^8.6.0"
+  }
+}

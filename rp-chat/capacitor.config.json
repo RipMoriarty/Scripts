@@ -1,0 +1,12 @@
+{
+  "appId": "com.rpchat.app",
+  "appName": "РП Чат",
+  "webDir": "www",
+  "backgroundColor": "#0e1016",
+  "plugins": {
+    "SystemBars": {
+      "insetsHandling": "native",
+      "style": "DARK"
+    }
+  }
+}

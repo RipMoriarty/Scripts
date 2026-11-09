@@ -1,0 +1,76 @@
+name: Build RP Chat APK
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'rp-chat/**'
+      - '.github/workflows/rp-chat-apk.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    working-directory: rp-chat
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Run tests
+        run: npm test
+
+      - name: Generate Android project
+        run: npx cap add android
+
+      - name: Apply app icon
+        run: |
+          if [ -d resources/android/res ]; then
+            cp -rv resources/android/res/. android/app/src/main/res/
+          fi
+
+      - name: Sync web assets
+        run: npx cap sync android
+
+      - name: Build debug APK
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Collect APK
+        run: |
+          mkdir -p dist
+          cp android/app/build/outputs/apk/debug/app-debug.apk dist/RP-Chat.apk
+          ls -lh dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RP-Chat-apk
+          path: rp-chat/dist/RP-Chat.apk
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="rp-chat-build-${{ github.run_number }}"
+          gh release create "$TAG" dist/RP-Chat.apk \
+            --title "РП Чат — сборка #${{ github.run_number }}" \
+            --notes "Установочный файл для Android: RP-Chat.apk (подпись debug, для установки вручную)."
