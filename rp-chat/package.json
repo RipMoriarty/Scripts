@@ -5,7 +5,8 @@
   "description": "РП Чат — приложение для ролевых диалогов с ИИ-персонажами (DeepSeek через OpenRouter)",
   "type": "module",
   "scripts": {
-    "test": "node tests/unit.test.mjs && node tests/api.test.mjs",
+    "test": "node tests/unit.test.mjs && node tests/api.test.mjs && node tests/server.test.mjs && node tests/community.test.mjs",
+    "server": "node server/server.mjs",
     "sync": "cap sync android"
   },
   "dependencies": {

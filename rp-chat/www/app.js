@@ -1,5 +1,6 @@
 import * as L from './lib.js';
 import { chatCompletion, fetchModels, checkConnection, ApiError } from './api.js';
+import { createGroups } from './groups.js';
 
 const STORAGE_KEY = 'rpchat.v1';
 const $app = document.getElementById('app');
@@ -9,6 +10,7 @@ const $toasts = document.getElementById('toasts');
 /* =====================================================================
    Хранилище
    ===================================================================== */
+const EMPTY_COMMUNITY = { url: '', token: '', userId: '', name: '' };
 let db = loadDb();
 
 function loadDb() {
@@ -20,12 +22,13 @@ function loadDb() {
         settings: { ...L.DEFAULT_SETTINGS, ...(d.settings || {}) },
         characters: (d.characters || []).map(L.normalizeCharacter),
         chats: d.chats && typeof d.chats === 'object' ? d.chats : {},
+        community: { ...EMPTY_COMMUNITY, ...(d.community || {}) },
       };
     }
   } catch (e) {
     console.error('Не удалось прочитать данные', e);
   }
-  return { settings: { ...L.DEFAULT_SETTINGS }, characters: L.SEED_CHARACTERS.map(L.normalizeCharacter), chats: {} };
+  return { settings: { ...L.DEFAULT_SETTINGS }, characters: L.SEED_CHARACTERS.map(L.normalizeCharacter), chats: {}, community: { ...EMPTY_COMMUNITY } };
 }
 
 function save() {
@@ -199,6 +202,16 @@ function autoGrow(ta) {
 /* =====================================================================
    Навигация
    ===================================================================== */
+const groups = createGroups({
+  h, toast, openSheet, openModal, closeOverlay, confirmDialog, copyText, shareOrShow, avatarEl, field, autoGrow,
+  go: (p) => go(p),
+  replace: (p) => replace(p),
+  back: () => back(),
+  save: () => save(),
+  getDb: () => db,
+  autoPickModel: () => autoPickModel(),
+});
+
 function currentRoute() {
   const p = (location.hash.slice(1) || '/').split('/').filter(Boolean);
   return { name: p[0] || 'home', id: p[1] ? decodeURIComponent(p[1]) : null };
@@ -226,10 +239,15 @@ let chatUI = null;
 function render() {
   const r = currentRoute();
   chatUI = null;
+  groups.teardown();
   let view;
   if (r.name === 'chat' && r.id) view = viewChat(r.id);
   else if (r.name === 'edit' && r.id) view = viewEdit(r.id);
   else if (r.name === 'settings') view = viewSettings();
+  else if (r.name === 'groups') view = groups.viewGroups();
+  else if (r.name === 'group-new') view = groups.viewGroupNew();
+  else if (r.name === 'group' && r.id) view = groups.viewGroup(r.id);
+  else if (r.name === 'catalog') view = r.id ? groups.viewCatalogItem(r.id) : groups.viewCatalog();
   else view = viewHome();
   $app.replaceChildren(...view);
   if (chatUI) chatUI.list.scrollTop = chatUI.list.scrollHeight;
@@ -247,7 +265,7 @@ function lastSnippet(ch) {
 }
 
 function viewHome() {
-  const list = h('div', { class: 'scroll pad-bottom' });
+  const list = h('div', { class: 'scroll' });
 
   if (L.needsApiKey(db.settings.baseUrl) && !db.settings.apiKey.trim()) {
     list.append(
@@ -290,7 +308,7 @@ function viewHome() {
     h('button', { class: 'btn primary grow', onclick: () => go('/edit/new') }, '＋ Создать персонажа'),
     h('button', { class: 'btn', onclick: importMenu }, 'Импорт'),
   );
-  return [bar, list, fab];
+  return [bar, list, fab, groups.tabbar('home')];
 }
 
 function lastActivity(ch) {
@@ -302,10 +320,12 @@ function lastActivity(ch) {
 function characterMenu(ch) {
   openSheet(ch.name, [
     { label: '✏️ Редактировать', onClick: () => go('/edit/' + encodeURIComponent(ch.id)) },
-    { label: '📄 Дублировать', onClick: () => { db.characters.push(L.normalizeCharacter({ ...ch, id: undefined, name: ch.name + ' (копия)' })); save(); render(); } },
+    { label: '📄 Дублировать', onClick: () => { db.characters.push(L.normalizeCharacter({ ...ch, id: undefined, publishedId: undefined, name: ch.name + ' (копия)' })); save(); render(); } },
+    { label: ch.publishedId ? '🌐 Обновить в каталоге' : '🌐 Опубликовать в каталог', onClick: () => groups.publishCharacter(ch) },
+    ch.publishedId && { label: '🚫 Снять с публикации', onClick: () => groups.unpublishCharacter(ch) },
     { label: '📤 Экспорт карточки', onClick: () => shareOrShow('Карточка: ' + ch.name, JSON.stringify(L.characterToExport(ch), null, 2)) },
     { label: '🗑 Удалить', danger: true, onClick: () => deleteCharacter(ch) },
-  ]);
+  ].filter(Boolean));
 }
 
 async function deleteCharacter(ch) {
@@ -972,6 +992,9 @@ function viewSettings() {
     field('Ваше имя', textInput('userName', { placeholder: 'Как к вам обращаться', maxLength: 40 })),
     field('Описание вашего персонажа', personaTa),
 
+    h('div', { class: 'section-title' }, 'Сервер сообщества (группы и каталог)'),
+    groups.settingsSection(),
+
     h('div', { class: 'section-title' }, 'Данные'),
     h('button', { class: 'btn block', onclick: exportBackup }, '📤 Резервная копия (персонажи и чаты)'),
     h('button', { class: 'btn block', onclick: importBackupFile }, '📥 Восстановить из копии'),
@@ -985,8 +1008,11 @@ function viewSettings() {
 }
 
 function exportBackup() {
-  const { apiKey, ...settings } = db.settings;
-  const data = { type: 'rpchat-backup', version: 1, exportedAt: new Date().toISOString(), settings, characters: db.characters, chats: db.chats };
+  // Секреты в копию не попадают: ни ключ, ни ключи сохранённых профилей серверов, ни доступ к серверу сообщества.
+  const { apiKey, profiles, ...settings } = db.settings;
+  const safeProfiles = {};
+  for (const [k, p] of Object.entries(profiles || {})) safeProfiles[k] = { ...p, apiKey: '' };
+  const data = { type: 'rpchat-backup', version: 1, exportedAt: new Date().toISOString(), settings: { ...settings, profiles: safeProfiles }, characters: db.characters.map(({ publishedId, ...c }) => c), chats: db.chats };
   shareOrShow('Резервная копия РП Чат', JSON.stringify(data));
 }
 
@@ -1007,11 +1033,14 @@ function importBackupFile() {
 
 async function restoreBackup(obj) {
   if (!Array.isArray(obj.characters)) { toast('Копия повреждена'); return; }
-  if (!(await confirmDialog('Заменить текущих персонажей и чаты данными из копии? Ваш API-ключ сохранится.', 'Восстановить', false))) return;
+  if (!(await confirmDialog('Заменить текущих персонажей и чаты данными из копии? Ваши ключи и подключение к серверу сообщества сохранятся.', 'Восстановить', false))) return;
+  const profiles = {};
+  for (const [k, p] of Object.entries(obj.settings?.profiles || {})) profiles[k] = { ...p, apiKey: db.settings.profiles?.[k]?.apiKey || '' };
   db = {
-    settings: { ...L.DEFAULT_SETTINGS, ...(obj.settings || {}), apiKey: db.settings.apiKey },
+    settings: { ...L.DEFAULT_SETTINGS, ...(obj.settings || {}), apiKey: db.settings.apiKey, profiles },
     characters: obj.characters.map(L.normalizeCharacter),
     chats: obj.chats && typeof obj.chats === 'object' ? obj.chats : {},
+    community: db.community,
   };
   save();
   toast('Восстановлено');

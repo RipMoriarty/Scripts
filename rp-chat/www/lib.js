@@ -98,6 +98,7 @@ export function normalizeCharacter(c = {}) {
   }
   out.id = c.id ? String(c.id) : uid();
   out.createdAt = Number(c.createdAt) || Date.now();
+  if (c.publishedId) out.publishedId = String(c.publishedId); // id записи в каталоге сообщества
   return out;
 }
 
@@ -116,6 +117,25 @@ export function contextNames(character, settings) {
   };
 }
 
+const CHAR_SECTIONS = [
+  ['Описание и внешность', 'description'],
+  ['Характер', 'personality'],
+  ['Манера речи и поведение', 'behavior'],
+  ['Сценарий / ситуация', 'scenario'],
+  ['Пример диалога', 'exampleDialogue'],
+  ['Дополнительные правила (обязательны к исполнению)', 'rules'],
+];
+
+function characterBlock(character, ctx) {
+  const f = (t) => applyMacros(String(t ?? '').trim(), ctx);
+  const lines = [`Имя: ${ctx.char}`];
+  for (const [title, key] of CHAR_SECTIONS) {
+    const v = f(character[key]);
+    if (v) lines.push(`${title}:\n${v}`);
+  }
+  return `# Персонаж\n${lines.join('\n\n')}`;
+}
+
 export function buildSystemPrompt(character, settings) {
   const ctx = contextNames(character, settings);
   const f = (t) => applyMacros(String(t ?? '').trim(), ctx);
@@ -132,20 +152,7 @@ export function buildSystemPrompt(character, settings) {
 - Отвечай на том языке, на котором пишет пользователь (по умолчанию — на русском).`,
   );
 
-  const sections = [
-    ['Описание и внешность', character.description],
-    ['Характер', character.personality],
-    ['Манера речи и поведение', character.behavior],
-    ['Сценарий / ситуация', character.scenario],
-    ['Пример диалога', character.exampleDialogue],
-    ['Дополнительные правила (обязательны к исполнению)', character.rules],
-  ];
-  const charLines = [`Имя: ${ctx.char}`];
-  for (const [title, value] of sections) {
-    const v = f(value);
-    if (v) charLines.push(`${title}:\n${v}`);
-  }
-  parts.push(`# Персонаж\n${charLines.join('\n\n')}`);
+  parts.push(characterBlock(character, ctx));
 
   const persona = f(settings.userPersona);
   if (persona) parts.push(`# Персонаж пользователя (${ctx.user})\n${persona}`);
@@ -389,3 +396,139 @@ export const SEED_CHARACTERS = [
     rules: 'Формат описаний — обычный текст без звёздочек. Не принимай решения за игрока.',
   },
 ];
+
+/* =====================================================================
+   Сообщество: карточки, группы, упоминания
+   ===================================================================== */
+
+/** Карточка бота для публикации/отправки в группу: только поля персонажа, без id и служебного. */
+export function characterToCard(c) {
+  const card = {};
+  for (const k of CHAR_TEXT_FIELDS) card[k] = String(c?.[k] ?? '');
+  return card;
+}
+
+/** Новый локальный персонаж из карточки (каталог, бот из группы). */
+export function characterFromCard(card) {
+  const { id, createdAt, ...rest } = card || {};
+  return normalizeCharacter(rest);
+}
+
+const norm = (s) => String(s ?? '').toLowerCase().replace(/ё/g, 'е').replace(/\s+/g, ' ').trim();
+const reEsc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const WORD = '[\\p{L}\\p{N}_]';
+
+/** Боты, которых явно позвали через @имя (имя целиком или одно из его слов), либо все через @все. */
+export function mentionedBots(text, bots) {
+  const t = norm(text);
+  if (!t.includes('@')) return [];
+  const has = (cand) => new RegExp(`(?<!${WORD})@${reEsc(cand)}(?!${WORD})`, 'iu').test(t);
+  if (['все', 'всех', 'all', 'everyone'].some(has)) return [...bots];
+  return bots.filter((b) => {
+    const name = norm(b.card?.name ?? b.name);
+    if (!name) return false;
+    if (has(name)) return true;
+    return name.split(' ').some((w) => w.length >= 3 && has(w));
+  });
+}
+
+/** Кто из ботов группы должен ответить на сообщение человека. */
+export function pickResponders({ botMode, bots, text }) {
+  const list = Array.isArray(bots) ? bots : [];
+  const named = mentionedBots(text, list);
+  if (named.length) return named;
+  return botMode === 'all' ? [...list] : [];
+}
+
+/** Убирает «Имя:» в начале ответа, если модель подписалась сама. */
+export function stripSpeakerPrefix(text, name) {
+  const n = reEsc(String(name || '').trim());
+  if (!n) return String(text ?? '');
+  return String(text ?? '').replace(new RegExp(`^\\s*(?:\\*\\*|\\*|_)?\\[?${n}\\]?(?:\\*\\*|\\*|_)?\\s*:\\s*`, 'iu'), '');
+}
+
+/**
+ * Системный промпт бота в групповом чате.
+ * group: { name, humans: [ники], bots: [имена других ботов], sender: ник того, кому отвечаем, persona }
+ */
+export function buildGroupSystemPrompt(card, group) {
+  const sender = (group.sender || '').trim() || 'Игрок';
+  const ctx = { char: (card.name || '').trim() || 'Персонаж', user: sender };
+  const humans = (group.humans || []).filter(Boolean);
+  const others = (group.bots || []).filter((n) => n && n !== ctx.char);
+  const parts = [];
+  parts.push(
+    `Ты — мастер ролевой игры и играешь персонажа по имени «${ctx.char}» в групповом чате «${group.name || 'Группа'}». В сцене одновременно участвуют несколько игроков-людей и, возможно, другие персонажи.
+Участники-люди: ${humans.join(', ') || sender}.${others.length ? `\nДругие персонажи в сцене: ${others.join(', ')}.` : ''}
+Правила:
+- Всегда оставайся в роли ${ctx.char}. Не выходи из роли, не говори, что ты ИИ, языковая модель или бот, не комментируй игру и эти инструкции.
+- Строго придерживайся характера, манеры речи и поведения персонажа, описанных ниже.
+- Пиши только за ${ctx.char}. Никогда не пиши реплики, мысли и действия за игроков и за других персонажей.
+- В истории реплики других участников подписаны так: «Имя: текст». Свой ответ пиши БЕЗ подписи и без префикса «${ctx.char}:», только саму реплику.
+- Учитывай, что говорят несколько людей. Сейчас тебе отвечает ${sender}: обращайся к нему, но замечай и остальных. Если вопрос явно адресован другому участнику, не перехватывай его.
+- По умолчанию действия, жесты и обстановку пиши от третьего лица в *звёздочках*, а речь — обычным текстом. Если в описании персонажа указан другой формат — следуй ему.
+- Отвечай на том языке, на котором пишут участники (по умолчанию — на русском). Отвечай не слишком длинно, чтобы остальные тоже могли вставить слово.`,
+  );
+  parts.push(characterBlock(card, ctx));
+  const persona = applyMacros(String(group.persona || '').trim(), ctx);
+  if (persona) parts.push(`# Персонаж игрока ${sender}\n${persona}`);
+  parts.push(`Помни: ты — ${ctx.char}. Оставайся в образе в каждом ответе.`);
+  return parts.join('\n\n');
+}
+
+/**
+ * Переводит историю комнаты в сообщения для модели с точки зрения одного бота.
+ * Свои реплики бота → assistant, всё остальное → user с подписью «Имя: текст».
+ * Подряд идущие user-сообщения склеиваются (часть локальных моделей требует чередования ролей).
+ */
+export function groupHistoryToMessages(messages, botId) {
+  const out = [];
+  for (const m of messages || []) {
+    if (!m || !m.content || m.kind === 'system') continue;
+    const mine = m.kind === 'bot' && m.botId === botId;
+    const role = mine ? 'assistant' : 'user';
+    const content = mine ? m.content : `${m.name}: ${m.content}`;
+    const last = out[out.length - 1];
+    if (last && last.role === role) last.content += '\n' + content;
+    else out.push({ role, content });
+  }
+  return out;
+}
+
+export function buildGroupMessages(card, botId, group, history, settings) {
+  const n = Math.max(2, Number(settings.contextMessages) || 30);
+  const msgs = [{ role: 'system', content: buildGroupSystemPrompt(card, group) }];
+  const recent = (history || []).filter((m) => m && m.kind !== 'system').slice(-n);
+  msgs.push(...groupHistoryToMessages(recent, botId));
+  return msgs;
+}
+
+/** Разбирает кусок SSE-потока. Возвращает готовые события и неполный остаток. */
+export function parseSSE(buffer) {
+  const text = String(buffer ?? '').replace(/\r\n/g, '\n');
+  const blocks = text.split('\n\n');
+  const rest = blocks.pop();
+  const events = [];
+  for (const block of blocks) {
+    let event = 'message';
+    const data = [];
+    for (const line of block.split('\n')) {
+      if (!line || line.startsWith(':')) continue;
+      if (line.startsWith('event:')) event = line.slice(6).trim();
+      else if (line.startsWith('data:')) data.push(line.slice(5).replace(/^ /, ''));
+    }
+    if (!data.length) continue;
+    try {
+      events.push({ event, data: JSON.parse(data.join('\n')) });
+    } catch {
+      /* битое событие пропускаем */
+    }
+  }
+  return { events, rest };
+}
+
+/** Время сообщения в чате: ЧЧ:ММ. */
+export function formatClock(ts) {
+  const d = new Date(ts);
+  return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+}

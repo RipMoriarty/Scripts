@@ -204,4 +204,108 @@ test('listAllModels: Ollama / LM Studio / Kobold', () => {
   assert.deepEqual(L.listAllModels(null), []);
 });
 
+console.log('группы и сообщество');
+
+const bots = [
+  { id: 'b1', card: { name: 'Мира' } },
+  { id: 'b2', card: { name: 'Старый Гоблин' } },
+  { id: 'b3', card: { name: 'Ёжик' } },
+];
+
+test('mentionedBots: имя, слово из имени, регистр, ё/е, границы слов', () => {
+  const ids = (t) => L.mentionedBots(t, bots).map((b) => b.id);
+  assert.deepEqual(ids('@Мира, привет'), ['b1']);
+  assert.deepEqual(ids('эй @мира!'), ['b1']);
+  assert.deepEqual(ids('@гоблин, а ты?'), ['b2']);
+  assert.deepEqual(ids('@Старый Гоблин, а ты?'), ['b2']);
+  assert.deepEqual(ids('@Ежик иди сюда'), ['b3']);
+  assert.deepEqual(ids('привет, Мира'), []); // без @ не считается
+  assert.deepEqual(ids('@Мирабель'), []); // не часть более длинного слова
+  assert.deepEqual(ids('почта a@Мира.ru'), []); // перед @ — буква
+  assert.deepEqual(ids('@Мира и @Гоблин'), ['b1', 'b2']);
+  assert.deepEqual(ids('@все, слушайте'), ['b1', 'b2', 'b3']);
+  assert.deepEqual(ids('@all'), ['b1', 'b2', 'b3']);
+});
+
+test('pickResponders: all отвечают все, mention — только позванные, @ важнее режима', () => {
+  const ids = (a) => a.map((b) => b.id);
+  assert.deepEqual(ids(L.pickResponders({ botMode: 'all', bots, text: 'привет' })), ['b1', 'b2', 'b3']);
+  assert.deepEqual(ids(L.pickResponders({ botMode: 'mention', bots, text: 'привет' })), []);
+  assert.deepEqual(ids(L.pickResponders({ botMode: 'mention', bots, text: '@мира привет' })), ['b1']);
+  assert.deepEqual(ids(L.pickResponders({ botMode: 'all', bots, text: '@мира привет' })), ['b1']);
+  assert.deepEqual(L.pickResponders({ botMode: 'all', bots: [], text: 'x' }), []);
+});
+
+test('stripSpeakerPrefix убирает подпись «Имя:» только в начале', () => {
+  assert.equal(L.stripSpeakerPrefix('Мира: *кивает* Да.', 'Мира'), '*кивает* Да.');
+  assert.equal(L.stripSpeakerPrefix('**Мира**: Да.', 'Мира'), 'Да.');
+  assert.equal(L.stripSpeakerPrefix('[Мира]: Да.', 'Мира'), 'Да.');
+  assert.equal(L.stripSpeakerPrefix('Она сказала Мира: нет', 'Мира'), 'Она сказала Мира: нет');
+  assert.equal(L.stripSpeakerPrefix('Просто текст', 'Мира'), 'Просто текст');
+});
+
+test('buildGroupSystemPrompt: участники, роль, макросы на отправителя, персона', () => {
+  const card = L.characterToCard({ ...mira, description: 'Хозяйка таверны для {{user}}.' });
+  const p = L.buildGroupSystemPrompt(card, { name: 'Таверна', humans: ['Аня', 'Борис'], bots: ['Мира', 'Гоблин'], sender: 'Борис', persona: 'Борис — бард.' });
+  assert.match(p, /«Мира» в групповом чате «Таверна»/);
+  assert.match(p, /Участники-люди: Аня, Борис/);
+  assert.match(p, /Другие персонажи в сцене: Гоблин\./); // себя в списке нет
+  assert.match(p, /Хозяйка таверны для Борис\./);
+  assert.match(p, /Персонаж игрока Борис\nБорис — бард\./);
+  assert.match(p, /БЕЗ подписи/);
+  assert.doesNotMatch(p, /\{\{/);
+});
+
+test('groupHistoryToMessages: свои реплики — assistant, остальные — user с подписью, склейка и пропуск системных', () => {
+  const msgs = [
+    { kind: 'system', content: 'Аня присоединилась' },
+    { kind: 'user', name: 'Аня', content: 'Привет всем' },
+    { kind: 'user', name: 'Борис', content: 'Здорово' },
+    { kind: 'bot', name: 'Мира', botId: 'b1', content: '*кивает*' },
+    { kind: 'bot', name: 'Гоблин', botId: 'b2', content: 'Хе-хе' },
+    { kind: 'user', name: 'Аня', content: '@Мира, пива' },
+  ];
+  assert.deepEqual(L.groupHistoryToMessages(msgs, 'b1'), [
+    { role: 'user', content: 'Аня: Привет всем\nБорис: Здорово' },
+    { role: 'assistant', content: '*кивает*' },
+    { role: 'user', content: 'Гоблин: Хе-хе\nАня: @Мира, пива' },
+  ]);
+  // с точки зрения Гоблина Мира — «другой участник», её реплика склеена с предыдущими user-сообщениями
+  const g = L.groupHistoryToMessages(msgs, 'b2');
+  assert.deepEqual(g.map((m) => m.role), ['user', 'assistant', 'user']);
+  assert.match(g[0].content, /Борис: Здорово\nМира: \*кивает\*$/);
+  assert.equal(g[1].content, 'Хе-хе');
+  assert.equal(g[2].content, 'Аня: @Мира, пива');
+});
+
+test('buildGroupMessages: system первым, окно contextMessages, последним — сообщение человека', () => {
+  const history = Array.from({ length: 10 }, (_, i) => ({ kind: 'user', name: 'Аня', content: 'м' + i }));
+  const card = L.characterToCard(mira);
+  const m = L.buildGroupMessages(card, 'b1', { name: 'Г', humans: ['Аня'], bots: [], sender: 'Аня' }, history, { contextMessages: 3 });
+  assert.equal(m[0].role, 'system');
+  assert.equal(m.at(-1).role, 'user');
+  assert.match(m.at(-1).content, /м9$/);
+  assert.equal(m.at(-1).content.includes('м6'), false);
+  assert.match(m.at(-1).content, /м7/);
+});
+
+test('parseSSE: события, комментарии, CRLF, неполный хвост, битый JSON', () => {
+  const r = L.parseSSE(': connected\n\nevent: message\ndata: {"id":1}\n\nevent: typing\r\ndata: {"on":true}\r\n\r\nevent: message\ndata: {"id"');
+  assert.deepEqual(r.events, [{ event: 'message', data: { id: 1 } }, { event: 'typing', data: { on: true } }]);
+  assert.match(r.rest, /^event: message/);
+  const r2 = L.parseSSE(r.rest + ':2}\n\nevent: x\ndata: не json\n\n');
+  assert.deepEqual(r2.events, [{ event: 'message', data: { id: 2 } }]);
+  assert.equal(r2.rest, '');
+});
+
+test('characterToCard / characterFromCard: только поля персонажа, новый id', () => {
+  const card = L.characterToCard({ ...mira, apiKey: 'секрет', chat: [1] });
+  assert.equal(card.id, undefined);
+  assert.equal(card.apiKey, undefined);
+  assert.equal(card.name, 'Мира');
+  const back = L.characterFromCard({ ...card, id: 'чужой' });
+  assert.notEqual(back.id, 'чужой');
+  assert.equal(back.name, 'Мира');
+});
+
 console.log(`\nunit: ${passed} passed`);
