@@ -306,6 +306,7 @@ with sync_playwright() as pw:
     page.get_by_role("button", name="Ollama (ПК)").click()
     check(page.input_value("input[type=url]") == LOCAL, "пресет Ollama подставляет адрес сервера")
     check(page.locator("text=Как подключить свой сервер").first.is_visible() and not page.locator("text=Как получить бесплатный доступ").first.is_visible(), "показана инструкция для своего сервера вместо OpenRouter")
+    check(page.locator("text=Tailscale").first.is_visible(), "в подсказке для своего сервера есть инструкция по Tailscale")
     check(page.input_value("input[type=password]") == "" and page.input_value("input[placeholder='Название модели']") == "", "ключ и модель OpenRouter не переносятся на локальный сервер")
     check(not page.get_by_role("button", name="Найти бесплатные DeepSeek").is_visible() and page.get_by_role("button", name="Показать модели сервера").is_visible(), "кнопки поиска подстроены под локальный сервер")
     page.get_by_role("button", name="Проверить подключение").click()
